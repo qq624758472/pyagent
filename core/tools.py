@@ -22,6 +22,12 @@ class ConfirmRequired(Exception):
     走确认流；handler 收到 _confirmed=True 后放行。"""
 
 
+# 同一任务内「只确认一次」的工具：用户点头后，本任务内后续调用直接放行。
+# 只放 run_python——修脚本天然是「写→跑→改→再跑」的循环，每次都弹窗太吵；
+# 递归删除、shell 命令的内容每次都不同（确认的就是那条具体命令），仍逐次确认。
+ONCE_PER_TASK = frozenset({"run_python"})
+
+
 @dataclass
 class Tool:
     name: str
@@ -337,9 +343,12 @@ def _run_python(ws, cfg, path, args="", _progress=None, _confirmed=False):
     if ws is None:
         return "错误: 未挂载工作区。请先挂载工作区（脚本须在工作区内）。"
     # 高危：本地 Python 同样能删工作区外文件/联网，与 shell 同级风险，
-    # 执行前需用户确认（对齐 run_command 的安全模型）
+    # 执行前需用户确认（对齐 run_command 的安全模型）。但它属于
+    # ONCE_PER_TASK：同一任务内确认过一次后不再重复询问。
     if not _confirmed:
-        raise ConfirmRequired(f"执行 Python 脚本: {path}（本地解释器，无沙箱）")
+        raise ConfirmRequired(
+            f"执行 Python 脚本: {path}（本地解释器，无沙箱；"
+            "同一任务内后续执行不再询问）")
     try:
         target = ws.resolve(path, must_exist=True)
         if target.suffix != ".py":
@@ -355,7 +364,7 @@ def _run_python(ws, cfg, path, args="", _progress=None, _confirmed=False):
     interactive = []
     if re.search(r"\binput\s*\(", src):
         interactive.append("input()")
-    if _re.search(r"\bsys\.stdin\b", src):
+    if re.search(r"\bsys\.stdin\b", src):
         interactive.append("sys.stdin")
     if interactive:
         return ("错误: 脚本包含交互式输入（" + "、".join(interactive) + "），"
@@ -422,7 +431,7 @@ def _install_skill(ws, cfg, url="", subdir=""):
 
 
 def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
-                 confirm=None, should_stop=None) -> str:
+                 confirm=None, should_stop=None, approved=None) -> str:
     """统一执行入口：永远返回字符串观察结果，不向 Agent 抛异常
 
     progress: 可选进度回调（callable(str)）。仅支持进度的工具
@@ -433,7 +442,12 @@ def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
     （--task 单次等非交互模式不传 confirm，保证安全）。
     should_stop: 可选停止信号（callable()->bool）。长任务工具
     （web_collect，参数名 _should_stop）会收到，使「停止」按钮能真正中断
-    原本同步阻塞、看门狗触发也无法打断的采集。"""
+    原本同步阻塞、看门狗触发也无法打断的采集。
+    approved: 可选 dict，**任务级确认结果**记录 {工具名: 允许与否}。
+    ONCE_PER_TASK 里的工具（run_python）用户确认过一次后写入 True，同一任务
+    内的后续调用直接放行、不再弹窗——修脚本常需反复执行，每次都确认会很吵；
+    用户拒绝则写入 False，本任务内后续调用直接拒绝、也不再弹窗（避免反复
+    骚扰）。每次 Agent.run() 新建一个 dict 传入，任务结束即失效。"""
     # V30 技能工具：skill_<slug> 动态生成，不在 TOOLS 注册表里
     if name not in TOOLS:
         try:
@@ -462,10 +476,26 @@ def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
         return f"错误: 参数不匹配 - {e}"
     except ValueError:
         pass                                      # 签名不可检（极少见），放行
+    # 任务级确认结果命中：本任务内已对 run_python 做过决定 → 直接用结论
+    if (approved is not None and name in ONCE_PER_TASK
+            and name in approved and "_confirmed" in params):
+        if not approved[name]:
+            log.info("工具 %s 本任务内已被拒绝，直接拒绝（不再询问）", name)
+            return ("错误: 用户已拒绝执行高危操作（本任务内已拒绝过该工具）。"
+                    "请与用户确认意图，或换一种非破坏性方式，不要重复尝试同一操作。")
+        log.info("工具 %s 本任务内已确认过，直接执行", name)
+        try:
+            return str(t.handler(ws, cfg, **dict(kwargs, _confirmed=True)))
+        except WorkspaceError as e:
+            log.warning("工具 %s 拒绝: %s", name, e)
+            return f"错误: {e}"
+        except Exception as e:
+            log.exception("工具 %s 执行异常", name)
+            return f"错误: 工具内部错误({type(e).__name__}): {e}"
     try:
         return str(t.handler(ws, cfg, **kwargs))
     except ConfirmRequired as e:
-        return _run_confirmed(name, t, ws, cfg, kwargs, str(e), confirm)
+        return _run_confirmed(name, t, ws, cfg, kwargs, str(e), confirm, approved)
     except WorkspaceError as e:
         log.warning("工具 %s 拒绝: %s", name, e)
         return f"错误: {e}"
@@ -476,11 +506,21 @@ def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
         return f"错误: 工具内部错误({type(e).__name__}): {e}"
 
 
-def _run_confirmed(name, tool_obj, ws, cfg, kwargs, reason, confirm) -> str:
-    """高危操作确认流：免确认配置 > 用户回调 > 非交互默认拒绝"""
+def _run_confirmed(name, tool_obj, ws, cfg, kwargs, reason, confirm,
+                   approved=None) -> str:
+    """高危操作确认流：免确认配置 > 用户回调 > 非交互默认拒绝
+
+    用户给出结论后写入 approved（ONCE_PER_TASK 工具）：允许 → True，
+    拒绝 → False。同一任务内的后续调用直接按该结论处理，不再弹窗。"""
     log.warning("高危操作待确认: %s | %s", name, reason)
+
+    def _remember(ok: bool):
+        if approved is not None and name in ONCE_PER_TASK:
+            approved[name] = ok
+
     if not getattr(cfg, "confirm_dangerous", True):
         log.info("confirm_dangerous=false，免确认执行: %s", name)
+        _remember(True)
     elif confirm is None:
         return ("错误: 该操作需要用户确认，但当前模式不支持交互确认，已拒绝执行。"
                 f"（{reason}）如为受信自动化，可在配置中关闭 confirm_dangerous。")
@@ -490,6 +530,7 @@ def _run_confirmed(name, tool_obj, ws, cfg, kwargs, reason, confirm) -> str:
         except Exception as e:
             log.warning("确认回调异常，按拒绝处理: %s", e)
             ok = False
+        _remember(ok)
         if not ok:
             return (f"错误: 用户已拒绝执行高危操作（{reason}）。"
                     "请与用户确认意图，或换一种非破坏性方式，不要重复尝试同一操作。")

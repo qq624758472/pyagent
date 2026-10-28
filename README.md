@@ -91,9 +91,12 @@ pyagent/
 
 以下操作在执行前会弹确认框（`confirm_dangerous`，默认开启）：
 
-- 递归删除目录（`delete_file` 且 `recursive=true`）
-- 执行 shell 命令（`run_command`，还需 `allow_shell=true`）
+- 递归删除目录（`delete_file` 且 `recursive=true`）——每次确认
+- 执行 shell 命令（`run_command`，还需 `allow_shell=true`）——每次确认
 - 执行本地 Python 脚本（`run_python`，无沙箱，与 shell 同级风险）
+  ——**同一任务内只确认一次**：修脚本是「写→跑→改→再跑」的循环，
+  每次都弹窗太吵；一次允许后本任务内后续执行直接放行，任务结束授权失效；
+  点了拒绝则该任务内继续拒绝（不会反复骚扰）
 
 `--task` 单次模式没有交互通道，**默认拒绝**这些操作；受信自动化可在配置中
 关闭 `confirm_dangerous`。

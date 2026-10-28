@@ -167,8 +167,8 @@ class SettingsDialog(QDialog):
             "关闭时调试卡仍存在，只是默认收起）")
         self.chk_debug.setChecked(bool(getattr(config, "debug_mode", False)))
         self.chk_confirm = QCheckBox(
-            "高危操作需用户确认（递归删除目录 / shell / 本地 Python 执行；"
-            "关闭后自动执行）")
+            "高危操作需用户确认（递归删除目录 / shell 命令 / 本地 Python 执行；"
+            "Python 同一任务内只问一次；关闭后自动执行）")
         self.chk_confirm.setChecked(bool(getattr(config, "confirm_dangerous", True)))
 
         # 技能开关（带已发现技能数提示）

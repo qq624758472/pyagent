@@ -86,6 +86,69 @@ cfg_nc = Config(allow_shell=True, confirm_dangerous=False)
 r = execute_tool("run_command", ws, cfg_nc, {"command": "echo free"})
 check("confirm_dangerous=false → 免确认", "exit_code=0" in r, r[:60])
 
+print("== 3b. run_python 每任务只确认一次 ==")
+(tmp / "ok.py").write_text("print('ran')", encoding="utf-8")
+asked = []
+
+
+def _yes(name, why):
+    asked.append(name)
+    return True
+
+
+approved = {}                            # 模拟一次 Agent.run() 的任务作用域
+r1 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_yes, approved=approved)
+check("首次执行需确认且成功", len(asked) == 1 and "ran" in r1, r1[:80])
+r2 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_yes, approved=approved)
+check("同任务内第二次不再询问", len(asked) == 1, f"询问次数={len(asked)}")
+check("同任务内第二次仍然执行", "ran" in r2, r2[:80])
+r3 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_yes, approved=approved)
+check("同任务内第三次也不再询问", len(asked) == 1 and "ran" in r3)
+
+approved2 = {}                          # 新任务 → 结论失效，必须重新询问
+r4 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_yes, approved=approved2)
+check("新任务重新询问", len(asked) == 2 and "ran" in r4, f"询问次数={len(asked)}")
+
+approved3 = {}                          # 用户拒绝 → 记 False，本任务内不再弹窗
+rejected = []
+
+
+def _no(name, why):
+    rejected.append(name)
+    return False
+
+
+r5 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_no, approved=approved3)
+check("拒绝后不执行", "用户已拒绝" in r5, r5[:60])
+check("拒绝记为 False", approved3.get("run_python") is False, str(approved3))
+r6 = execute_tool("run_python", ws, cfg, {"path": "ok.py"},
+                  confirm=_no, approved=approved3)
+check("拒绝后再次调用不再弹窗（直接拒绝）", len(rejected) == 1,
+      f"询问次数={len(rejected)}")
+check("直接拒绝也有明确原因", "用户已拒绝" in r6 and "本任务内已拒绝过" in r6, r6[:70])
+
+# shell 不在 ONCE_PER_TASK：同一任务内每条命令都要单独确认
+shell_asked = []
+approved4 = {}
+
+
+def _yes2(name, why):
+    shell_asked.append(name)
+    return True
+
+
+execute_tool("run_command", ws, cfg, {"command": "echo a"},
+             confirm=_yes2, approved=approved4)
+execute_tool("run_command", ws, cfg, {"command": "echo b"},
+             confirm=_yes2, approved=approved4)
+check("shell 命令每条都确认（不共享授权）", len(shell_asked) == 2,
+      f"询问次数={len(shell_asked)}")
+
 print("== 4. 参数校验：模型参数错误 vs handler 内部 bug ==")
 r = execute_tool("list_files", ws, cfg, {"bad_param": 1})
 check("未知参数 → 参数不匹配", r.startswith("错误: 参数不匹配"), r[:60])

@@ -142,6 +142,7 @@ class Agent:
         empty_streak = 0           # 连续空回复计数（V23）
         protocol_nudge = 0         # 协议提醒次数（V26 思考含工具意图时追问）
         written = {}               # 本任务成功写入的文件 path 集合（V21 落盘追踪）
+        approved = {}              # 本任务内各工具的确认结论 {name: 允许与否}
         log.info("任务开始: %s | 历史消息数=%d workspace=%s",
                  brief(task, 120), len(self.messages),
                  self.workspace.root if self.workspace else "未挂载")
@@ -301,7 +302,8 @@ class Agent:
             yield {"type": "action", "name": name, "arguments": arguments}
             result = self._execute_and_observe(
                 name, arguments, step, task, written,
-                should_stop=should_stop, progress=progress, confirm=confirm)
+                should_stop=should_stop, progress=progress, confirm=confirm,
+                approved=approved)
             yield {"type": "observation", "content": result}
             used_tools = True        # 本任务已实际执行过工具
 
@@ -346,6 +348,8 @@ class Agent:
         tools = openai_tools(cfg=cfg, ws=self.workspace, task=task)
         empty_streak = 0
         loaded_skills = []           # 本任务已加载的技能（V30）
+        written = {}                 # 本任务写入的文件（落盘追踪，原生路径同样适用）
+        approved = {}                # 本任务内各工具的确认结论 {name: 允许与否}
         log.info("原生协议启动: model=%s 工具数=%d",
                  getattr(self.llm, "model", "?"), len(tools))
         for step in range(self.max_iterations):
@@ -390,8 +394,9 @@ class Agent:
                     log.info("ACTION: %s %s", tc["name"], oneline_json(args))
                     yield {"type": "action", "name": tc["name"], "arguments": args}
                     result = self._execute_and_observe(
-                        tc["name"], args, step, task, {},
-                        should_stop=should_stop, progress=progress, confirm=confirm)
+                        tc["name"], args, step, task, written,
+                        should_stop=should_stop, progress=progress,
+                        confirm=confirm, approved=approved)
                     yield {"type": "observation", "content": result}
                     tool_msgs.append({"role": "tool", "tool_call_id": tc["id"],
                                       "name": tc["name"], "content": result})
@@ -441,15 +446,17 @@ class Agent:
 
     # ---------- 工具执行 + 闭环校验（文本/原生协议共用） ----------
     def _execute_and_observe(self, name, arguments, step, task, written,
-                             should_stop=None, progress=None, confirm=None) -> str:
+                             should_stop=None, progress=None, confirm=None,
+                             approved=None) -> str:
         """执行工具并生成观察结果（含日志/截断/闭环提示）。
 
         文本协议与原生协议原本各写一份几乎相同的「执行→日志→截断→提醒」
-        流程，现抽为共用方法——修 bug 只需改一处。"""
+        流程，现抽为共用方法——修 bug 只需改一处。
+        approved: 本任务的一次性授权集合（run_python 确认过一次后免再询问）。"""
         t0 = time.monotonic()
         result = execute_tool(name, self.workspace, self._config(),
                               arguments, progress=progress, confirm=confirm,
-                              should_stop=should_stop)
+                              should_stop=should_stop, approved=approved)
         log.info("OBSERVATION(%d字, 耗时%.1fs): %s",
                  len(result), time.monotonic() - t0, brief(result, 400))
         if len(result) > MAX_OBS_LENGTH:
