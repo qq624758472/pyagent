@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyagent"
+version = "30.0.0"
+description = "可挂载工作区的智能助手：ReAct Agent + GUI/控制台双模式"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "PyQt5>=5.15.11",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+# 开发/测试：测试套件本身零依赖（桩 + 离屏 Qt），此处仅便于本地一键装齐
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["core", "ui"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]           # 中文注释/长文案较多，不强制折行
+
+[tool.pytest.ini_options]
+# 测试为脚本式断言套件，统一入口是 tests/run_all.py；
+# 若改用 pytest，需要先把各套件改写成 test_* 函数。
+addopts = "-q"
