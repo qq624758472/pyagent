@@ -194,12 +194,15 @@ def build_qss(c, s=1.0):
     }}
     #toolAction {{
         color: {c['text2']}; font-size: {f(11)}px; font-family: {MONO_FAMILIES};
+        background: transparent; border: none;
     }}
     #toolObs {{
         color: {c['text3']}; font-size: {f(11)}px; font-family: {MONO_FAMILIES};
+        background: transparent; border: none;
     }}
     #toolProgress {{
         color: {c['accent']}; font-size: {f(11)}px;
+        background: transparent; border: none;
     }}
     #sysLine {{ color: {c['text3']}; font-size: {f(11)}px; }}
     #errLine {{ color: {c['error']}; font-size: {f(11)}px; }}

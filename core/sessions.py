@@ -42,12 +42,15 @@ def save_session(sid: str, messages, workspace: str, title: str):
     """messages: Agent.messages（system 消息自动剔除）"""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     data = {
+        "schema_version": 2,
         "id": sid,
         "title": (title or "未命名会话")[:40],
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "workspace": workspace or "",
-        "messages": [[m["role"], (m.get("content") or "")]
-                     for m in messages if m.get("role") != "system"],
+        # 保留 OpenAI 对话协议的完整字段（tool_calls/tool_call_id/name 等）。
+        # 旧版 [role, content] 格式仍可读取，由 UI 层兼容迁移。
+        "messages": [dict(m) for m in messages
+                     if isinstance(m, dict) and m.get("role") != "system"],
     }
     # 置顶标记跨自动归档保留（每轮结束都会重写文件，不能丢）
     prev = load_session(sid) or {}

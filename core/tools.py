@@ -27,6 +27,20 @@ class ConfirmRequired(Exception):
 # 递归删除、shell 命令的内容每次都不同（确认的就是那条具体命令），仍逐次确认。
 ONCE_PER_TASK = frozenset({"run_python"})
 
+# 小模型编造的 IDE 风格工具名 → 真实工具（V31.2）。只收录**只读**工具：
+# 意图明确、无副作用，直接替模型执行；写/删/执行类一律不自动重定向。
+_READONLY_ALIASES = {
+    "open_file": "read_file", "readfile": "read_file", "cat": "read_file",
+    "view_file": "read_file", "show_file": "read_file", "get_file": "read_file",
+    "open": "read_file", "view": "read_file", "preview_file": "read_file",
+    "ls": "list_files", "dir": "list_files", "list_dir": "list_files",
+    "listdir": "list_files", "list_dir_files": "list_files",
+    "grep": "search_files", "find": "search_files", "glob": "search_files",
+    "search": "search_files", "find_files": "search_files",
+    "search_content": "search_files", "ripgrep": "search_files",
+    "kb": "kb_search", "knowledge_search": "kb_search",
+}
+
 
 @dataclass
 class Tool:
@@ -63,7 +77,9 @@ TOOL_SCHEMAS = {
         "path": ("string", "相对路径，默认 '.'"),
         "recursive": ("boolean", "是否递归子目录，默认 false")}),
     "read_file": _schema({
-        "path": ("string", "工作区内文件相对路径")}, ["path"]),
+        "path": ("string", "工作区内文件相对路径"),
+        "line_start": ("integer", "可选，起始行号（1 起）；只看文件某一段时用它"),
+        "line_end": ("integer", "可选，结束行号")}, ["path"]),
     "write_file": _schema({
         "path": ("string", "工作区内文件相对路径"),
         "content": ("string", "要写入的完整文本内容")}, ["path", "content"]),
@@ -76,7 +92,11 @@ TOOL_SCHEMAS = {
         "path": ("string", "相对路径"),
         "recursive": ("boolean", "递归删除整个目录树，默认 false")}, ["path"]),
     "search_files": _schema({
-        "pattern": ("string", "glob 通配符，如 *.py")}, ["pattern"]),
+        "pattern": ("string", "要搜索的关键字或 glob 通配符（如 *.py）。"
+                              "找代码符号/函数名时直接填关键字，如 g_eop_info"),
+        "content": ("boolean", "true=在文件内容中搜索该关键字；"
+                              "false 或省略=按文件名匹配。找代码符号请填 true"),
+        "path": ("string", "可选：限定在某个子目录内搜索，默认整个工作区")}),
     "run_command": _schema({
         "command": ("string", "要执行的 shell 命令")}, ["command"]),
     "web_collect": _schema({
@@ -138,10 +158,20 @@ def _list_files(ws, cfg, path=".", recursive=False):
     return ws.list_files(path, recursive)
 
 
-@tool("read_file", "读取工作区内文本文件内容(限200KB)", {"path": "文件相对路径"})
-def _read_file(ws, cfg, path):
+@tool("read_file", "读取工作区内文本文件内容(限200KB，可指定行区间)",
+      {"path": "文件相对路径",
+       "line_start": "可选，起始行号（1 起）",
+       "line_end": "可选，结束行号"})
+def _read_file(ws, cfg, path, line_start=None, line_end=None, **extra):
     _need_ws(ws)
-    return ws.read_file(path)
+    # V31.2 容错：模型常用 IDE 风格别名（start_line/end_line/line）
+    line_start = line_start or extra.get("start_line")
+    line_end = line_end or extra.get("end_line")
+    if line_start is None and extra.get("line") is not None:
+        line_start = line_end = extra.get("line")
+    if extra:
+        log.info("read_file 忽略多余参数: %s", ", ".join(extra))
+    return ws.read_file(path, line_start=line_start, line_end=line_end)
 
 
 @tool("write_file", "创建或覆盖文本文件(自动创建父目录)",
@@ -174,10 +204,30 @@ def _delete_file(ws, cfg, path, recursive=False, _confirmed=False):
     return ws.delete_file(path, recursive)
 
 
-@tool("search_files", "按 glob 通配符递归搜索工作区内文件名", {"pattern": "如 *.py"})
-def _search_files(ws, cfg, pattern):
+@tool("search_files",
+      "在工作区搜索：找文件名用 glob（如 *.py）；找代码符号/函数名/文本片段"
+      "用 content=true 在文件内容中逐行搜索（如 pattern=g_eop_info）。"
+      "关键字找不到时也会自动降级为内容搜索",
+      {"pattern": "要搜索的关键字或 glob 通配符（如 *.py）",
+       "content": "true=在文件内容中搜索，默认 false（按文件名匹配）",
+       "path": "可选：限定在某个子目录内搜索，默认整个工作区"})
+def _search_files(ws, cfg, pattern=None, content=None, path=None,
+                  recursive=None, **extra):
     _need_ws(ws)
-    return ws.search_files(pattern)
+    # V31.2 容错：小模型常把关键词塞进 content（{"content": "g_eop_info"}）
+    # 或漏掉 pattern —— 两种都按「内容搜索」处理，别让整轮迭代死在参数上
+    kw, mode = pattern, False
+    if isinstance(content, str) and content.strip():
+        kw = kw or content.strip()
+        mode = True
+    elif content is True:
+        mode = True
+    if extra:
+        log.info("search_files 忽略多余参数: %s", ", ".join(extra))
+    if not kw:
+        return ("错误: 缺少搜索关键字。请传 pattern，"
+                '如 search_files({"pattern": "g_eop_info", "content": true})。')
+    return ws.search_files(kw, content=mode, path=path)
 
 
 @tool("run_command", "在工作区目录内执行 shell 命令(需 allow_shell=true)",
@@ -201,7 +251,8 @@ def _run_command(ws, cfg, command="", _confirmed=False):
 @tool("web_collect",
       "联网采集：多引擎搜索（百度/必应/搜狗/360，风控自动切换）并用「筛选模型」"
       "自动过滤，直到凑满指定条数的有效数据（返回含标题/摘要/来源，可直接分析）。"
-      "涉及最新资讯/网络信息时优先使用本工具",
+      "仅用于互联网上的时效性公开信息（新闻/价格/版本发布等）。工作区内的文件、"
+      "代码、变量名/函数名不要联网搜索——用 search_files/kb_search 本地工具",
       {"query": "搜索关键词。中文专有名词过长搜不到时可尝试加引号或缩短",
        "criteria": "结果筛选标准，强烈建议填写：描述想要什么样的结果"
                    "（如'必须是2024年以后的卫星发射新闻'）；留空则仅按与查询的相关性过滤",
@@ -460,7 +511,20 @@ def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
             log.warning("技能工具执行失败 %s: %s", name, e)
     t = TOOLS.get(name)
     if t is None:
-        return f"错误: 未知工具 '{name}'。可用工具: {', '.join(TOOLS)}"
+        # 未知工具处理（V31.2）：小模型常编造 IDE 风格工具名（open_file /
+        # grep / ls…，日志实证）。只读类别名自动重定向到等价工具——直接
+        # 帮它把事办了；写/删/执行类只提示、不自动执行（避免误伤）。
+        alias = _READONLY_ALIASES.get(str(name).strip().lower())
+        if alias and alias in TOOLS:
+            log.info("未知工具 '%s' 自动重定向为 '%s'", name, alias)
+            t = TOOLS[alias]
+        else:
+            import difflib
+            avail = list(TOOLS)
+            close = difflib.get_close_matches(str(name), avail, n=1, cutoff=0.5)
+            hint = f"（你可能想用的是「{close[0]}」）" if close else ""
+            return (f"错误: 未知工具 '{name}'{hint}。"
+                    f"可用工具: {', '.join(avail)}")
     kwargs = dict(arguments or {})
     params = _sig_params(t.handler)
     if progress is not None and "_progress" in params:

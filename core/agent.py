@@ -15,14 +15,14 @@ MAX_OBS_LENGTH = 4000
 log = get_logger("core.agent")
 
 
-def _parse_tool_args(raw) -> dict:
-    """解析原生工具调用的 arguments（JSON 字符串；非法时返回空 dict）"""
+def _parse_tool_args(raw) -> Optional[dict]:
+    """解析原生工具 arguments；非法 JSON 或非对象返回 None，禁止空参数误执行。"""
     try:
         d = json.loads(raw or "{}")
-        return d if isinstance(d, dict) else {}
+        return d if isinstance(d, dict) else None
     except (json.JSONDecodeError, TypeError):
         log.warning("工具参数 JSON 解析失败: %s", brief(raw, 200))
-        return {}
+        return None
 
 
 def _is_skill_tool(name: str) -> bool:
@@ -72,10 +72,19 @@ SYSTEM_PROMPT_QA = """你是一个可以操作"工作区"目录的智能助手�
 # V28 原生 function calling 模式：system 保持极短。
 # 实测（gpt-oss-20B 经 llama.cpp 网关）：system 里的长中文指令会让模型把
 # 输出卡在 analysis 通道、final 通道为空；短 system + tools 参数则一切正常。
+# V31 实测（gpt-oss-20B @ Ollama）：此前"不确定的事实先用 web_collect 核实"
+# 一句会让模型对工作区内的代码符号去联网搜索（8 轮 web_collect 烧光迭代，
+# 日志 17:29 实证）——本地任务必须显式规定"工作区优先"路由。
 SYSTEM_PROMPT_NATIVE = (
-    "你是可以操作工作区目录的智能助手。需要文件信息或执行动作时调用工具，"
-    "拿到结果后用中文回答，不要编造工具结果。"
-    "涉及可能过时或你不确定的事实，先用 web_collect 核实再回答。"
+    "你是可以操作工作区目录的智能助手。工作区内的文件、代码、变量/函数名"
+    "一律先用本地工具处理：目录结构未知时才 list_files；已知目标直接读写。找代码符号用 "
+    "search_files（会自动搜索文件内容）；知识问答用 kb_search。"
+    "只有用户明确需要互联网上的时效信息（新闻/价格/软件版本等）时才调用 "
+    "web_collect，绝不联网搜索工作区内的变量名或代码。"
+    "每轮只调用一个工具，拿到结果后再决定下一步；不要并行发起多个工具调用。"
+    "调用前检查必填参数；参数不确定时先澄清，不要猜测或传空参数。"
+    "工具报错时先根据错误修正参数或更换方法，不要原样重复调用。"
+    "需要文件信息或执行动作时调用工具，拿到结果后用中文回答，不要编造工具结果。"
     "最终回答要完整给出结论，不要写“我需要先…”这类自述。"
     "若任务匹配某个 skill_* 技能工具，先调用它获取操作规范再执行。")
 
@@ -88,6 +97,9 @@ class Agent:
     KEEP_CHARS = 16000             # 上下文字符级上限（超出先裁老消息）
     MAX_EMPTY_RETRIES = 3          # 连续空回复上限（reasoning 模型高发，V23）
     MAX_PROTOCOL_NUDGES = 2        # 思考含工具意图时的协议提醒次数上限（V26）
+    REPEAT_NUDGE = 2               # 同一调用连续出现该次数起注入换思路警告（V31）
+    TOOL_STREAK_NUDGE = 3          # 同一工具（无论参数）连续调用该次数起警告（V31）
+    REASONING_BEAT = 1.0           # 思考期心跳间隔（秒）——喂 UI 看门狗
 
     def __init__(self, llm: LLMClient, workspace: Optional[Workspace] = None,
                  max_iterations: int = 8, qa_mode: bool = False):
@@ -97,6 +109,11 @@ class Agent:
         self.qa_mode = qa_mode      # V25 仅提问模式：纯对话，不执行工具
         self.messages = []          # 对话历史，跨 run 保持（多轮上下文）
         self._force_text = False    # 端点拒绝 tools 参数后置位，永久回退文本协议
+        self._reuse_task_on_fallback = False  # native→text 回退时复用已入历史的任务消息
+        self._last_call_sig = None  # 上一轮工具调用签名（V31 重复调用熔断）
+        self._repeat_count = 0      # 当前签名连续重复次数
+        self._last_tool_name = None # 上一轮工具名（V31 同工具刷屏熔断）
+        self._tool_streak = 0       # 同一工具连续调用次数
 
     # ---------- 外部接口 ----------
     def set_workspace(self, ws: Optional[Workspace]):
@@ -127,6 +144,8 @@ class Agent:
         由调用方提供线程安全的通道，如 GUI 的 Qt 信号）
         confirm: 可选高危操作确认回调 confirm(name, reason) -> bool，
         透传给 execute_tool（递归删除 / shell / 本地 Python 执行前弹确认）"""
+        self._last_call_sig, self._repeat_count = None, 0   # 重复熔断按任务重置
+        self._last_tool_name, self._tool_streak = None, 0
         # V28 协议分流：native = 原生 function calling（gpt-oss 等思考模型
         # 唯一可靠路径）；text = 原有 ACTION/ANSWER 文本协议
         if self._native_mode():
@@ -134,7 +153,12 @@ class Agent:
             return
         self._refresh_system_prompt(task)   # 技能清单按任务预筛（V30）
         skill_hint = self._auto_skill_hint(task)   # 强匹配技能自动注入（V30）
-        self.messages.append({"role": "user", "content": task + skill_hint})
+        if self._reuse_task_on_fallback:
+            # 原生协议入口已经把当前任务写入历史；回退时复用该消息，
+            # 避免重复追加任务导致小模型把同一请求理解成两个任务。
+            self._reuse_task_on_fallback = False
+        else:
+            self.messages.append({"role": "user", "content": task + skill_hint})
         self._trim_history()
         used_tools = False          # 本任务是否已成功执行过工具
         redirected = False         # 教程式纠偏只用一次（防循环）
@@ -158,11 +182,29 @@ class Agent:
             t0 = time.monotonic()
             # 喂看门狗：覆盖「组消息 → 首 token」静默窗口，避免慢端点被误报超时
             yield {"type": "keepalive"}
+            # V31.2：思考期心跳——reasoning 分片不产生正文事件，长时间静默
+            # 会让 UI 看门狗误判超时（gpt-oss 推理模型高发）
+            act = {"n": 0}
+            last_beat = t0
+
+            def _act():
+                act["n"] += 1
+
+            # 桩/自定义 LLM 可能没有 on_activity 形参 → 兼容调用
             try:
-                for delta in self.llm.chat_stream(self.messages):
+                stream = self.llm.chat_stream(self.messages, on_activity=_act)
+            except TypeError:
+                stream = self.llm.chat_stream(self.messages)
+            try:
+                for delta in stream:
                     full += delta
                     chunk_n += 1
                     yield {"type": "delta", "content": delta}
+                    if act["n"]:
+                        now = time.monotonic()
+                        if now - last_beat >= self.REASONING_BEAT:
+                            last_beat = now
+                            yield {"type": "keepalive"}
                     if should_stop and should_stop():
                         break
             except LLMError as e:
@@ -303,7 +345,9 @@ class Agent:
             result = self._execute_and_observe(
                 name, arguments, step, task, written,
                 should_stop=should_stop, progress=progress, confirm=confirm,
-                approved=approved)
+                approved=approved,
+                repeat=self._track_repeat(name, arguments)[0],
+                streak=self._tool_streak)
             yield {"type": "observation", "content": result}
             used_tools = True        # 本任务已实际执行过工具
 
@@ -352,7 +396,11 @@ class Agent:
         approved = {}                # 本任务内各工具的确认结论 {name: 允许与否}
         log.info("原生协议启动: model=%s 工具数=%d",
                  getattr(self.llm, "model", "?"), len(tools))
-        for step in range(self.max_iterations):
+        # V31：手动计数替代 for-range——空回合重试不消耗迭代配额。
+        # gpt-oss-20B 实测偶发"全空回合"（无正文/思考/工具调用），此前每次
+        # 重试烧掉 1/8 迭代，8 上限经不起浪费；由 MAX_EMPTY_RETRIES 封顶防死循环。
+        step = 0
+        while step < self.max_iterations:
             if should_stop and should_stop():
                 log.info("任务取消（外部停止）")
                 yield {"type": "cancelled"}
@@ -366,14 +414,20 @@ class Agent:
                         yield {"type": "delta", "content": ev["text"]}
                     elif ev["type"] == "tool_call":
                         tool_calls.append(ev)
+                    elif ev["type"] == "keepalive":
+                        # V31.2：思考期心跳，透传给 UI 喂看门狗（防误报超时）
+                        yield {"type": "keepalive"}
             except LLMError as e:
                 # 端点不认 tools 参数 → 自动回退文本协议
-                if "HTTP 400" in str(e) and not getattr(self, "_force_text", False):
+                if ("HTTP 400" in str(e)
+                        and not getattr(self, "_force_text", False)):
                     self._force_text = True
+                    self._reuse_task_on_fallback = True
                     log.warning("端点拒绝 tools 参数（HTTP 400），自动回退文本协议")
                     yield {"type": "redirect",
                            "content": "该端点不支持原生工具调用，已自动切换到文本协议"}
-                    self.messages = []
+                    # _run_native 已经把当前任务追加到历史。移除这一条，
+                    # 让文本协议入口重新追加一次；保留此前完整对话上下文。
                     yield from self.run(task, should_stop, progress, confirm)
                     return
                 log.error("任务终止(LLM错误): %s", brief(e, 200))
@@ -392,11 +446,18 @@ class Agent:
                 for tc in tool_calls:
                     args = _parse_tool_args(tc["arguments"])
                     log.info("ACTION: %s %s", tc["name"], oneline_json(args))
-                    yield {"type": "action", "name": tc["name"], "arguments": args}
-                    result = self._execute_and_observe(
-                        tc["name"], args, step, task, written,
-                        should_stop=should_stop, progress=progress,
-                        confirm=confirm, approved=approved)
+                    if args is None:
+                        result = ("错误: 工具参数不是合法 JSON 对象。请重新生成参数，"
+                                  "必须使用双引号并提供 object 格式；本次未执行工具。")
+                        yield {"type": "format_error", "content": result}
+                    else:
+                        yield {"type": "action", "name": tc["name"], "arguments": args}
+                        result = self._execute_and_observe(
+                            tc["name"], args, step, task, written,
+                            should_stop=should_stop, progress=progress,
+                            confirm=confirm, approved=approved,
+                            repeat=self._track_repeat(tc["name"], args)[0],
+                            streak=self._tool_streak)
                     yield {"type": "observation", "content": result}
                     tool_msgs.append({"role": "tool", "tool_call_id": tc["id"],
                                       "name": tc["name"], "content": result})
@@ -417,9 +478,10 @@ class Agent:
                     tool_msgs[-1]["content"] += (
                         "\n\n（已加载技能规范：" + "、".join(loaded_skills)
                         + "。请严格按照上面技能规范中的步骤执行本任务，"
-                        "规范要求调用的工具要照常调用；完成后再给出最终答案。）")
+                          "规范要求调用的工具要照常调用；完成后再给出最终答案。）")
                 self.messages.extend(tool_msgs)
                 self._trim_history()
+                step += 1               # 只有真实执行过工具才消耗迭代配额
                 continue
 
             if text.strip():
@@ -428,6 +490,7 @@ class Agent:
                 log.info("ANSWER: %s", brief(text, 600))
                 yield {"type": "answer", "content": text}
                 return
+            # 空回合：不消耗迭代配额（V31），MAX_EMPTY_RETRIES 封顶
             empty_streak += 1
             if empty_streak >= self.MAX_EMPTY_RETRIES:
                 log.error("连续 %d 次空回复，任务终止", empty_streak)
@@ -437,22 +500,48 @@ class Agent:
                 return
             yield {"type": "format_error",
                    "content": f"模型本轮既无正文也无工具调用（第 {empty_streak}/"
-                              f"{self.MAX_EMPTY_RETRIES} 次），已要求重试"}
+                              f"{self.MAX_EMPTY_RETRIES} 次），已要求重试（不消耗迭代）"}
             self.messages.append({"role": "user",
-                                  "content": "（请给出最终回答，或调用工具继续。）"})
+                                  "content": "（上一轮输出为空。请调用工具继续任务，"
+                                             "或直接给出最终中文回答。）"})
         log.error("达到最大迭代次数(%d)，任务终止", self.max_iterations)
         yield {"type": "error",
                "content": f"已达到最大迭代次数({self.max_iterations})，任务终止。"}
 
     # ---------- 工具执行 + 闭环校验（文本/原生协议共用） ----------
+    def _track_repeat(self, name: str, arguments: dict):
+        """记录本任务的工具调用签名，返回 (同签名连续次数, 同工具连续次数)
+
+        小模型两种高发病（日志实证，V31）：
+        ① 完全相同的调用连发（search_files 相同 pattern 连调 5 次）；
+        ② 同一工具换参数刷屏（web_collect 换 8 种关键词烧光迭代）。
+        前者按「工具+参数」签名计数，后者只按工具名计数。"""
+        try:
+            sig = (name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+        except (TypeError, ValueError):
+            sig = (name, str(arguments))
+        if sig == self._last_call_sig:
+            self._repeat_count += 1
+        else:
+            self._last_call_sig = sig
+            self._repeat_count = 1
+        if name == self._last_tool_name:
+            self._tool_streak += 1
+        else:
+            self._last_tool_name = name
+            self._tool_streak = 1
+        return self._repeat_count, self._tool_streak
+
     def _execute_and_observe(self, name, arguments, step, task, written,
                              should_stop=None, progress=None, confirm=None,
-                             approved=None) -> str:
-        """执行工具并生成观察结果（含日志/截断/闭环提示）。
+                             approved=None, repeat=1, streak=1) -> str:
+        """执行工具并生成观察结果（含日志/截断/闭环提示/重复调用警告）。
 
         文本协议与原生协议原本各写一份几乎相同的「执行→日志→截断→提醒」
         流程，现抽为共用方法——修 bug 只需改一处。
-        approved: 本任务的一次性授权集合（run_python 确认过一次后免再询问）。"""
+        approved: 本任务的一次性授权集合（run_python 确认过一次后免再询问）。
+        repeat: 该「工具+参数」签名连续重复的次数；streak: 同一工具连续调用
+        的次数（无论参数）。超过阈值时在观察结果里注入换思路警告（V31）。"""
         t0 = time.monotonic()
         result = execute_tool(name, self.workspace, self._config(),
                               arguments, progress=progress, confirm=confirm,
@@ -482,25 +571,43 @@ class Agent:
                         "写入或更新——你现在运行的仍是旧版本文件。你在回复里展示的"
                         "修改代码并没有落盘。请先 ACTION write_file 把完整新代码写入"
                         f"「{stale}」，再 ACTION run_python 重新执行。）")
-            elif "```" in (arguments.get("content") or "") and name != "write_file":
+            elif (isinstance(arguments.get("content"), str)
+                  and "```" in arguments["content"] and name != "write_file"):
                 pass        # content 参数里带代码块属正常调用，不算未落盘
+                # （必须 isinstance 判型：search_files 也有 content 参数，是布尔）
             log.warning("执行失败: %s %s", name, brief(result, 120))
-            return obs
-        # 成功：技能规范以「指令」呈现；普通工具附目标核对提醒
-        if _is_skill_tool(name):
-            return (f"SKILL（操作规范，请按它执行本任务）：\n{result}"
-                    "\n\n（已加载技能规范。请严格按照上面技能规范中的步骤执行"
-                    "本任务，规范要求调用的工具要照常调用；完成后再给出 ANSWER。）")
-        obs = f"OBSERVATION: {result}"
-        if name in ("run_python", "run_command"):
-            # 执行类工具成功 → 提醒对照任务目标自检
-            obs += ("\n\n（本次执行成功。请对照用户任务目标检查输出："
-                    "已达成 → ANSWER 总结结果；未达成 → 继续下一步。）")
-        if step >= 1:
-            # 小模型补偿：多步推理时注入任务提醒，防止跑偏/重复调用/忘了 ANSWER
-            obs += (f"\n\n（提醒：用户任务是「{brief(task, 60)}」。"
-                    "若已收集到足够信息，请直接 ANSWER 总结；"
-                    "不要重复调用相同工具。）")
+        else:
+            # 成功：技能规范以「指令」呈现；普通工具附目标核对提醒
+            if _is_skill_tool(name):
+                obs = (f"SKILL（操作规范，请按它执行本任务）：\n{result}"
+                       "\n\n（已加载技能规范。请严格按照上面技能规范中的步骤执行"
+                       "本任务，规范要求调用的工具要照常调用；完成后再给出 ANSWER。）")
+            else:
+                obs = f"OBSERVATION: {result}"
+                if name in ("run_python", "run_command"):
+                    # 执行类工具成功 → 提醒对照任务目标自检
+                    obs += ("\n\n（本次执行成功。请对照用户任务目标检查输出："
+                            "已达成 → ANSWER 总结结果；未达成 → 继续下一步。）")
+                if step >= 1:
+                    # 小模型补偿：多步推理时注入任务提醒，防止跑偏/重复调用/忘了 ANSWER
+                    obs += (f"\n\n（提醒：用户任务是「{brief(task, 60)}」。"
+                            "若已收集到足够信息，请直接 ANSWER 总结；"
+                            "不要重复调用相同工具。）")
+        # ---------- 重复调用熔断（V31） ----------
+        if repeat >= self.REPEAT_NUDGE:
+            obs += (f"\n\n⚠️ 重复调用警告：这是与上一轮完全相同的调用（已连续第 "
+                    f"{repeat} 次），同样的调用只会得到同样的结果。请立即改变策略："
+                    "检查参数是否用对、换用其他工具，或直接 ANSWER 总结已知信息——"
+                    "不要再重复这个调用。")
+            log.warning("重复调用熔断: %s 连续第 %d 次", name, repeat)
+        elif streak >= self.TOOL_STREAK_NUDGE and self._result_unproductive(result):
+            hint = ("联网已多次尝试仍无有效结果，请改用本地工具"
+                    "（search_files/kb_search/read_file）或基于已知信息直接 "
+                    "ANSWER，不要继续联网。" if name == "web_collect" else
+                    "这个方向看起来没有产出，请换用其他工具或换一种思路。")
+            obs += (f"\n\n⚠️ 方向警告：你已连续 {streak} 次调用同一工具「{name}」"
+                    f"（即使每次参数不同），且结果都没有产出。{hint}")
+            log.warning("同工具刷屏熔断: %s 连续第 %d 次", name, streak)
         return obs
 
     # ---------- 内部 ----------
@@ -551,6 +658,17 @@ class Agent:
         t = str(text).strip()
         t = Agent._ANS_PREFIX_RE.sub("", t, count=1).strip()
         return t or str(text).strip()
+
+    # 结果"没有产出"的标记（V31.2）：连续用同一工具但每次都空手而归时
+    # 才提示换方向——有命中的连续搜索（如换关键词找符号）是正常策略，不打断
+    _UNPRODUCTIVE_MARKERS = ("未找到", "未获取到", "命中 0", "无匹配",
+                             "(空目录)", "(空文件)", "没有找到")
+
+    @staticmethod
+    def _result_unproductive(result: str) -> bool:
+        """工具结果是否"没有产出"（空结果/未命中）"""
+        r = str(result or "")
+        return any(m in r for m in Agent._UNPRODUCTIVE_MARKERS)
 
     @staticmethod
     def _execution_failed(name: str, result: str) -> bool:
@@ -603,17 +721,52 @@ class Agent:
             self.messages.append({"role": "assistant", "content": full})
 
     def _trim_history(self, keep: int = 24):
-        """双重上限：条数 keep 条 + 总字符 KEEP_CHARS——超出先裁老消息
+        """按完整对话单元裁剪历史，绝不拆开 assistant.tool_calls/tool 结果组。
 
-        字符级裁剪从索引 2 开始：system(0) 与首条用户消息(1，任务上下文)
-        永久保留（此前 pop(1) 会把首条任务消息也裁掉，注释与行为不符，V23 修正）"""
-        if len(self.messages) > keep + 1:
-            self.messages = [self.messages[0]] + self.messages[-keep:]
-        # content 可能是 None（原生协议：assistant 带 tool_calls 时无正文）
-        total = sum(len(m.get("content") or "") for m in self.messages)
-        while total > self.KEEP_CHARS and len(self.messages) > 3:
-            dropped = self.messages.pop(2)
-            total -= len(dropped.get("content") or "")
+        system 与当前会话首条 user 上下文保留；其余历史从最旧单元开始淘汰。
+        原生工具调用的 assistant 消息及其对应 tool 回复是一个不可拆分单元。
+        """
+        if len(self.messages) <= 2:
+            return
+
+        def _size(msg):
+            return (len(msg.get("content") or "")
+                    + len(json.dumps(msg.get("tool_calls") or [], ensure_ascii=False)))
+
+        def _drop_oldest_unit():
+            if len(self.messages) <= 2:
+                return False
+            first = self.messages[2]
+            calls = first.get("tool_calls") or []
+            if first.get("role") == "assistant" and calls:
+                ids = {c.get("id") for c in calls if c.get("id")}
+                end = 3
+                seen = set()
+                while end < len(self.messages) and self.messages[end].get("role") == "tool":
+                    tid = self.messages[end].get("tool_call_id")
+                    if ids and tid not in ids:
+                        break
+                    if tid:
+                        seen.add(tid)
+                    end += 1
+                    if ids and ids.issubset(seen):
+                        break
+                del self.messages[2:end]
+            elif first.get("role") == "tool":
+                # 旧数据或异常历史中的孤立 tool 消息，按连续 tool 块整体清除。
+                while len(self.messages) > 2 and self.messages[2].get("role") == "tool":
+                    self.messages.pop(2)
+            else:
+                self.messages.pop(2)
+            return True
+
+        total = sum(_size(m) for m in self.messages)
+        while (len(self.messages) > keep + 1 or total > self.KEEP_CHARS):
+            before = len(self.messages)
+            removed = self.messages[2:]
+            if not _drop_oldest_unit():
+                break
+            total -= sum(_size(m) for m in removed[:before - len(self.messages)])
 
     # ---------- 解析（小模型友好：本地修复常见 JSON 病，避免浪费重试轮次） ----------
     @staticmethod

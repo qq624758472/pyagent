@@ -61,6 +61,13 @@ def run_task(agent, text, confirm=None):
 
 
 def run(config: Config, workspace=None, task=None):
+    # V31：控制台模式自动恢复上次工作区（GUI 会记住 last_workspace，
+    # 控制台此前不接——--task 单次任务常因"未挂载工作区"被迫联网或拒绝）
+    if workspace is None and getattr(config, "last_workspace", ""):
+        try:
+            workspace = Workspace(config.last_workspace)
+        except WorkspaceError as e:
+            print(f"[提示] 上次工作区不可用，未挂载: {e}")
     agent = Agent(LLMClient(config), workspace, max_iterations=config.max_iterations)
     print(BANNER)
     if workspace is not None:

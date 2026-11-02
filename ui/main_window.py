@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMessageBox, QPlainTextEdit, QPushButton,
                              QScrollArea, QMenu, QShortcut, QStackedWidget,
                              QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
-                             QVBoxLayout, QWidget)
+                             QVBoxLayout, QWidget, QSizePolicy)
 
 from core.agent import Agent
 from core.config import PROJECT_ROOT
@@ -35,8 +35,7 @@ log = get_logger("ui.main_window")
 
 
 def _msg_pair(m):
-    """会话文件里 messages 存的是 [role, content] 对，内存里是 dict
-    （system/tool_calls 等结构只有内存态有）——统一取成 (role, content)"""
+    """兼容旧版 [role, content] 与新版完整 OpenAI 消息对象。"""
     if isinstance(m, dict):
         return m.get("role"), (m.get("content") or "")
     if isinstance(m, (list, tuple)) and len(m) >= 2:
@@ -75,6 +74,40 @@ class SelectableLabel(QTextEdit):
         menu = QMenu(self)
         menu.addAction("复制", self._copy)
         menu.exec_(e.globalPos())
+
+
+class AutoHeightLabel(SelectableLabel):
+    """高度随文档内容自适应的只读文本块
+
+    踩坑记录（V31.2）：QTextEdit 的 document().size().height() 在控件刚
+    创建、尚未进入布局时返回 0 —— 此前按它算固定高度，得到的永远是
+    max(16, 0+6)=16px，文字被裁成一条线，展开「执行过程」卡看到的
+    全是空行（用户报：点开看不到文字、卡片叠在一起）。
+    正确做法：监听 documentSizeChanged，等布局给出真实宽度后再同步高度；
+    超长内容封顶并保留内部滚动条。"""
+
+    def __init__(self, text="", parent=None, objname="", max_height=0):
+        super().__init__(text, parent, objname=objname)
+        self._max_h = int(max_height or 0)
+        self.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.document().documentLayout().documentSizeChanged.connect(
+            self._sync_height)
+        QTimer.singleShot(0, self._sync_height)      # 布局完成后补一次
+
+    def _sync_height(self, *_a):
+        try:
+            h = int(self.document().size().height())
+        except Exception:
+            return
+        if h <= 0:
+            return                        # 还没布局出宽度，等下一次信号
+        h += 10                            # 边框/内边距
+        if self._max_h:
+            h = min(h, self._max_h)
+        if abs(self.height() - h) > 1:     # 避免反复触发布局抖动
+            self.setFixedHeight(max(16, h))
 
 
 class InputBox(QPlainTextEdit):
@@ -343,8 +376,10 @@ class ToolCollapseCard(QFrame):
         self._refresh_head()
 
     def _body_line(self, text: str):
-        lab = SelectableLabel(str(text), self.body, objname="toolProgress")
-        lab.setFixedHeight(max(16, lab.document().size().height() + 6))
+        # V31.2：用 AutoHeightLabel（高度随文档自适应，封顶 260px + 内部滚动）
+        # 旧的 setFixedHeight(document().size().height()) 在控件未布局时算到 0
+        lab = AutoHeightLabel(str(text), self.body, objname="toolProgress",
+                              max_height=260)
         self.body_v.addWidget(lab)
         self._lines += 1
         return lab
@@ -878,7 +913,7 @@ class MainWindow(QMainWindow):
         """缩放后按新字号重算历史消息块高度"""
         for w in (getattr(self, "_stream_view", None),):
             if w is not None:
-                w.setFixedHeight(max(self._px(40), w.document().size().height()))
+                w._sync_height()          # V31.2：AutoHeightLabel 自带同步方法
         self._scroll_bottom()
 
     def toggle_theme(self):
@@ -951,7 +986,8 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         v.addLayout(head)
 
-        self._stream_view = SelectableLabel("", row, objname="streamText")
+        self._stream_view = AutoHeightLabel("", row, objname="streamText",
+                                            max_height=2400)
         self._stream_view.setPlaceholderText("")
         self._stream_view.setFixedHeight(self._px(24))
         v.addWidget(self._stream_view)
@@ -962,8 +998,8 @@ class MainWindow(QMainWindow):
             self._start_assistant()
         cur = self._stream_view.toPlainText() + str(text)
         self._stream_view.setPlainText(cur)
-        self._stream_view.setFixedHeight(
-            max(self._px(24), int(self._stream_view.document().size().height()) + 8))
+        # 高度由 AutoHeightLabel 自行同步（V31.2：手动按 document().size()
+        # 算高在控件未布局时恒为 0，正文被裁成一行）
         self._scroll_bottom()
 
     def _finish_assistant(self):
@@ -980,7 +1016,7 @@ class MainWindow(QMainWindow):
             from ui.md_render import md_to_html
             body = re.sub(r"^\s*ANSWER:\s*", "", text, flags=re.M)
             view.setHtml(md_to_html(body))
-            view.setFixedHeight(max(self._px(24), int(view.document().size().height()) + 8))
+            # 高度由 AutoHeightLabel 自动同步（setHtml 同样触发 documentSizeChanged）
         except Exception as e:                    # 渲染失败保留纯文本
             log.warning("Markdown 渲染失败，保留纯文本: %s", e)
 
@@ -1216,7 +1252,9 @@ class MainWindow(QMainWindow):
             role, content = _msg_pair(m)
             if role == "system" or not role:
                 continue
-            self.agent.messages.append({"role": role, "content": content})
+            self.agent.messages.append(
+                dict(m) if isinstance(m, dict)
+                else {"role": role, "content": content})
         self._replay(msgs)
         rounds = sum(1 for m in msgs
                      if _msg_pair(m)[0] == "user"
@@ -1325,7 +1363,9 @@ class MainWindow(QMainWindow):
                 continue
             if role == "user" and content.startswith("OBSERVATION"):
                 continue
-            self.agent.messages.append({"role": role, "content": content})
+            self.agent.messages.append(
+                dict(m) if isinstance(m, dict)
+                else {"role": role, "content": content})
         self._clear_chat()
         self._replay(msgs)
         self._session_id = sid

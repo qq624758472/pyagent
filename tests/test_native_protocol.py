@@ -115,7 +115,7 @@ check("回退后标记 _force_text", getattr(ag2, "_force_text", False) is True)
 check("回退后走文本协议", ag2._native_mode() is False)
 srv2.shutdown()
 
-print("== 3. 工具参数 JSON 非法 → 不崩溃 ==")
+print("== 3. 工具参数 JSON 非法 → 不执行并要求重试 ==")
 state3 = {"n": 0}
 
 
@@ -134,7 +134,8 @@ ag3 = agent_for(srv3)
 ev3 = list(ag3.run("列文件"))
 k3 = [e["type"] for e in ev3]
 check("非法参数未导致崩溃", "error" not in k3, str(k3))
-check("工具仍被调用（空参数）", "action" in k3, str(k3))
+check("非法参数不会执行工具", "action" not in k3, str(k3))
+check("给出参数格式修正提示", "format_error" in k3, str(k3))
 srv3.shutdown()
 
 print("== 4. 纯文本回复 → 直接 answer ==")

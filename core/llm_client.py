@@ -30,6 +30,7 @@ class LLMClient:
     # 产出任何内容时重试——流式中断后重发会导致内容重复
     RETRY_ON_CONN = 2
     RETRY_BACKOFF = 1.5
+    REASONING_BEAT = 1.0           # 思考期心跳间隔（秒）——喂 UI 看门狗
 
     def __init__(self, cfg, profile=None):
         """profile: 角色名（"main"/"kb"/"web"），按 config.profiles 独立取
@@ -92,8 +93,19 @@ class LLMClient:
                 break                   # 正常完成，跳出重试循环
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else "?"
+                detail = ""
+                if e.response is not None:
+                    try:
+                        raw_detail = e.response.content or b""
+                        if isinstance(raw_detail, bytes):
+                            raw_detail = raw_detail.decode("utf-8", errors="replace")
+                        detail = str(raw_detail).strip()[:240]
+                    except Exception:
+                        detail = ""
                 log.error("LLM 请求失败 %s HTTP %s", m_desc, code)
-                raise LLMError(f"API 请求失败(HTTP {code})，请检查 base_url/api_key/模型名。") from e
+                suffix = f"；服务端信息: {detail}" if detail else ""
+                raise LLMError(
+                    f"API 请求失败(HTTP {code})，请检查 base_url/api_key/模型名。{suffix}") from e
             except requests.RequestException as e:
                 if chunks > 0 or attempt >= self.RETRY_ON_CONN:
                     log.error("LLM 网络错误 %s: %s", m_desc, brief(e, 200))
@@ -103,9 +115,11 @@ class LLMClient:
                             wait, attempt + 1, self.RETRY_ON_CONN, brief(e, 150))
                 time.sleep(wait)
 
-    def chat_stream(self, messages, model=None, timeout=None):
+    def chat_stream(self, messages, model=None, timeout=None, on_activity=None):
         """文本协议流：产出正文增量（str）。reasoning 单独收集，空正文时兜底。
-        timeout: 可选覆盖默认 (10,180)，用于长链路里的子步骤（如 web_collect 筛选）。"""
+        timeout: 可选覆盖默认 (10,180)，用于长链路里的子步骤（如 web_collect 筛选）。
+        on_activity: 可选回调，reasoning 分片到达时调用一次（V31.2：思考期
+        静默会让 UI 看门狗误判超时，调用方据此抛心跳）。"""
         if not self.api_key:
             raise LLMError("未配置 API Key。请设置环境变量 AGENT_API_KEY，"
                            "或通过界面「设置…」/控制台 /key 配置。")
@@ -126,6 +140,11 @@ class LLMClient:
                 yield data
             elif kind == "reasoning":
                 reasoning_buf.append(data)
+                if on_activity is not None:
+                    try:
+                        on_activity()
+                    except Exception:
+                        pass
         self.last_reasoning = "".join(reasoning_buf)
         log.info("LLM 响应完成 %s chunks=%d 用时 %.1fs",
                  m_desc, chunks, time.monotonic() - t0)
@@ -147,7 +166,12 @@ class LLMClient:
 
         {"type": "content", "text": ...}      正文增量
         {"type": "tool_call", "id","name","arguments"}   完整的一次工具调用
-        （思考内容不外抛，只进 last_reasoning 供诊断）"""
+        {"type": "keepalive"}                 思考期心跳（V31.2）
+        （思考内容不外抛，只进 last_reasoning 供诊断）
+
+        V31.2：gpt-oss 这类推理模型在出正文前会长时间只吐 reasoning——
+        此前这段"静默期"不产生任何事件，UI 看门狗 45s 无事件直接判超时
+        （日志 18:18 实证）。这里按 1s 间隔抛 keepalive 喂看门狗。"""
         if not self.api_key:
             raise LLMError("未配置 API Key。请设置环境变量 AGENT_API_KEY，"
                            "或通过界面「设置…」/控制台 /key 配置。")
@@ -162,12 +186,17 @@ class LLMClient:
         t0 = time.monotonic()
         calls = {}                 # index -> {id, name, arguments}
         content_parts, reasoning_parts = [], []
+        last_beat = t0
         for kind, data in self._iter_sse(payload, m_desc, timeout=timeout):
             if kind == "content":
                 content_parts.append(data)
                 yield {"type": "content", "text": data}
             elif kind == "reasoning":
                 reasoning_parts.append(data)
+                now = time.monotonic()
+                if now - last_beat >= self.REASONING_BEAT:
+                    last_beat = now
+                    yield {"type": "keepalive"}      # 思考期心跳：喂看门狗
             elif kind == "tool_delta":
                 for tc in data:
                     idx = tc.get("index", 0)
