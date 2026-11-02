@@ -25,6 +25,7 @@ SUITES = [
     ("test_agent_quality.py", False),        # 小模型：历史/工具调用完整性与回退
     ("test_autonomous_loop.py", False),      # 小模型自主编码：失败去重/测试闭环
     ("test_tcp_execution.py", False),       # TCP 服务器生命周期/客户端联调/完成门禁
+    ("test_confirm_flow.py", True),        # 高危操作确认：迟到点击拒绝/正常放行
     ("test_skills.py", False),              # 技能系统：发现/披露/工具/安全/集成
     ("test_web_collect.py", False),         # 联网采集：长任务心跳 / 可中断 / 预算
     ("test_session_delete.py", True),       # 会话删除（离屏 Qt）

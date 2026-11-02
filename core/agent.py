@@ -432,7 +432,13 @@ class Agent:
         # 编码任务以实际测试为完成条件，不能把 write_file 成功当作项目完成。
         coding_task = bool(ws and re.search(r"测试|运行|执行|验证|test|项目|project", task, re.I)
                            and re.search(r"代码|脚本|程序|创建|编写|实现|修改|开发|app\.py|\.py", task, re.I))
-        tests_required = coding_task and bool(re.search(r"测试|单元测试|unittest|pytest|test", task, re.I))
+        # TCP 联调以 tcp_echo_test 的真实发送/接收为验收标准；不能因工具名含
+        # test 或任务要求「测试结果」，误要求另外生成 unittest 脚本。
+        explicit_unit_tests = bool(re.search(
+            r"单元测试|unittest|pytest|测试脚本|测试文件|test[_-][\w-]*\.py", task, re.I))
+        tests_required = bool(coding_task and
+            (explicit_unit_tests or (not network_debug_task and
+             re.search(r"测试|test", task, re.I))))
         code_revision, verified_revision, tested_revision = 0, -1, -1
         network_verified = False
         completion_nudges = 0

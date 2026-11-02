@@ -168,7 +168,6 @@ def tcp_echo_test(ws, cfg, server_path="tcp_server.py", client_path="",
             return "错误: 测试消息长度必须在 1~2048 字节"
         # 不占用现有服务器的端口，避免误测到其他进程。
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((host, port))
             except OSError:
@@ -204,17 +203,25 @@ def tcp_echo_test(ws, cfg, server_path="tcp_server.py", client_path="",
         result = f"socket 客户端发送 {message!r}，服务端原样返回；"
         if client:
             env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-            try:
-                run = subprocess.run(
-                    _argv(client, ""), input=f"{message}\nquit\n",
-                    cwd=str(ws.root), env=env, capture_output=True,
-                    text=True, encoding="utf-8", errors="replace", timeout=7)
-            except subprocess.TimeoutExpired:
-                return "错误: 生成的 TCP 客户端未在 7 秒内退出，请提供可自动测试的非交互模式"
-            if run.returncode != 0 or str(message) not in run.stdout:
-                return ("错误: socket 回环通过，但生成的客户端未通过校验；"
-                        f"exit={run.returncode}; stdout={run.stdout[-500:]}; stderr={run.stderr[-300:]}")
-            result += "生成的客户端也发送/接收到测试消息；"
+            # 多次运行可检测客户端发送/接收线程争抢关闭 socket 的竞态。
+            # 仅输出 hello 不足以证明成功：同时出现收发错误必须判失败。
+            for attempt in range(1, 4):
+                try:
+                    run = subprocess.run(
+                        _argv(client, ""), input=f"{message}\nquit\n",
+                        cwd=str(ws.root), env=env, capture_output=True,
+                        text=True, encoding="utf-8", errors="replace", timeout=7)
+                except subprocess.TimeoutExpired:
+                    return (f"错误: 第 {attempt}/3 次测试客户端超时，"
+                            "请提供可自动测试的非交互模式")
+                output_text = (run.stdout or "") + (run.stderr or "")
+                bad_output = any(term in output_text.lower() for term in (
+                    "接收错误", "发送错误", "连接失败", "traceback", "winerror", "brokenpipe"))
+                if run.returncode != 0 or str(message) not in run.stdout or bad_output:
+                    return (f"错误: 第 {attempt}/3 次 TCP 客户端联调失败，"
+                            "可能存在并发关闭 socket 的竞态；"
+                            f"exit={run.returncode}; stdout={run.stdout[-450:]}; stderr={run.stderr[-250:]}")
+            result += "生成的客户端连续 3 次发送/接收测试通过；"
         return f"TCP联调通过：{result}服务端已在测试结束后回收。"
     except (OSError, ValueError) as exc:
         return f"错误: TCP 联调失败: {exc}"

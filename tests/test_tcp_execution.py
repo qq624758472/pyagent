@@ -97,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="pyagent_tcp_") as temp:
          "message": "hello", "port": port},
         confirm=lambda n, why: True)
     check("independent TCP integration passes", "TCP联调通过" in result)
-    check("generated client really checked", "生成的客户端也" in result)
+    check("generated client really checked three times", "客户端连续 3 次" in result)
 
     ws.write_file("tcp_client_bad.py", "print('unrelated')\n")
     bad = execute_tool("tcp_echo_test", ws, cfg,
@@ -105,7 +105,14 @@ with tempfile.TemporaryDirectory(prefix="pyagent_tcp_") as temp:
          "port": port}, confirm=lambda n, why: True)
     check("bad generated client is rejected", bad.startswith("错误:"))
 
-    task = "你自己打开TCP服务器接收，并用TCP客户端进行发送，然后进行调试。"
+    ws.write_file("tcp_client_false_pass.py", "print('hello')\nprint('接收错误: 10038')\n")
+    false_pass = execute_tool("tcp_echo_test", ws, cfg,
+        {"server_path": "tcp_server.py", "client_path": "tcp_client_false_pass.py",
+         "port": port}, confirm=lambda n, why: True)
+    check("client printing hello with socket error must fail", false_pass.startswith("错误:"))
+
+    task = ("你自己打开TCP服务器接收，并用TCP客户端进行发送，然后进行调试。"
+            "使用 tcp_echo_test 自动测试，必要时修改程序，汇报测试结果。")
     no_tool = Agent(ScriptModel(["我没有办法自己打开 socket，请在终端手工运行。"] * 5),
                     ws, max_iterations=6)
     events = list(no_tool.run(task))
