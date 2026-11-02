@@ -13,9 +13,10 @@ import os
 import re
 from dataclasses import asdict, fields
 from pathlib import Path
+from core.runtime import DATA_ROOT
 
 # 工程根目录 = core/ 的上级（放工程目录下，用户可直接找到）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = DATA_ROOT
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "pyagent.log"
 MAX_BYTES = 1024 * 1024          # 单文件 1MB

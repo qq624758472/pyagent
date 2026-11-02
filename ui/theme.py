@@ -5,53 +5,53 @@
 """
 
 # ============================================================
-# 主题配色（取自 Reasonix Studio 官方截图配色）
+# 产品主题：石墨蓝 / 云白，搭配鸢尾紫强调色
 # ============================================================
 THEMES = {
     "dark": {
-        "base": "#1A1A1A",        # 侧栏（偏暖炭黑，对齐原版）
-        "surface": "#232323",     # 主聊天区
-        "elevated": "#2B2B2B",    # 卡片/气泡/输入容器
-        "input_bg": "#202020",
-        "hover": "#333333",
-        "text": "#E8E8E8",
-        "text2": "#A0A0A0",
-        "text3": "#707070",
-        "accent": "#5B7FD4",      # 柔和灰蓝（降低饱和度）
+        "base": "#151923",        # 石墨蓝侧栏
+        "surface": "#1B202C",     # 主聊天区
+        "elevated": "#232A38",    # 卡片/气泡/输入容器
+        "input_bg": "#1B202C",
+        "hover": "#2D3546",
+        "text": "#EDF1FA",
+        "text2": "#A9B3C7",
+        "text3": "#8490A7",
+        "accent": "#8B91F8",      # 柔和灰蓝（降低饱和度）
         "accent_text": "#FFFFFF",
         "success": "#4ADE80",
         "error": "#E05252",
-        "border": "#2E2E2E",
-        "input_border": "#3E3E3E",
-        "user_bubble": "#383838",
-        "tool_bg": "#242424",
-        "scrollbar": "#3A3A3A",
-        "avatar_bg": "#2E3A55",   # 头像：柔蓝灰，不刺眼
-        "avatar_fg": "#9FB4D9",
-        "send_bg": "#343434",     # 发送按钮：沉稳中性色，hover 才亮
-        "send_border": "#484848",
+        "border": "#30384A",
+        "input_border": "#3C465C",
+        "user_bubble": "#303A57",
+        "tool_bg": "#202735",
+        "scrollbar": "#414C63",
+        "avatar_bg": "#34395D",   # 头像：柔蓝灰，不刺眼
+        "avatar_fg": "#C4C7FF",
+        "send_bg": "#6269D6",
+        "send_border": "#6269D6",
     },
     "light": {
-        "base": "#F9FAFB",
-        "surface": "#F3F4F6",
+        "base": "#F3F4F8",
+        "surface": "#FCFCFE",
         "elevated": "#FFFFFF",
         "input_bg": "#FFFFFF",
-        "hover": "#E9EBEE",
+        "hover": "#E9EBF3",
         "text": "#111827",
         "text2": "#6B7280",
-        "text3": "#9CA3AF",
-        "accent": "#5B6FD4",
+        "text3": "#788397",
+        "accent": "#6468D9",
         "accent_text": "#FFFFFF",
         "success": "#16A34A",
         "error": "#DC2626",
         "border": "#E5E7EB",
         "input_border": "#D1D5DB",
-        "user_bubble": "#E3EAF6",
+        "user_bubble": "#EDEFFD",
         "tool_bg": "#F5F6F8",
         "scrollbar": "#D1D5DB",
         "avatar_bg": "#DCE4F2",
         "avatar_fg": "#4A5B80",
-        "send_bg": "#E8E8E8",
+        "send_bg": "#6468D9",
         "send_border": "#D1D5DB",
     },
 }
@@ -75,7 +75,7 @@ def build_qss(c, s=1.0):
     f = lambda n: int(round(n * s))
     return f"""
     QMainWindow, QDialog {{ background: {c['surface']}; }}
-    QWidget {{ color: {c['text']}; font-size: {f(13)}px; }}
+    QWidget {{ font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"; color: {c['text']}; font-size: {f(13)}px; }}
 
     /* ---------- 侧栏 ---------- */
     #sidebar {{ background: {c['base']}; border-right: 1px solid {c['border']}; }}
@@ -250,4 +250,66 @@ def build_qss(c, s=1.0):
     }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+    /* ---------- Studio 产品组件 ---------- */
+    QPushButton {{ outline: none; }}
+    QPushButton:focus, QToolButton:focus {{ border: 1px solid {c['accent']}; }}
+    QToolTip {{ background: {c['elevated']}; color: {c['text']};
+        border: 1px solid {c['border']}; padding: 8px; }}
+    #brandBadge, #welcomeMark {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+            stop:0 {c['accent']}, stop:1 #5357B5);
+        color: #FFFFFF; border-radius: {f(12)}px;
+        font-size: {f(22)}px; font-weight: 700;
+    }}
+    #welcomeMark {{ border-radius: {f(18)}px; font-size: {f(30)}px; }}
+    #welcomeScroll, #welcomeScroll > QWidget > QWidget {{ background: {c['surface']}; }}
+    #settingsTitle {{ font-size: {f(22)}px; font-weight: 700; }}
+    #logoName {{ font-size: {f(18)}px; }}
+    #logoSub {{ font-size: {f(9)}px; color: {c['text2']}; }}
+    #newChatBtn {{ background: {c['send_bg']}; color: {c['accent_text']};
+        border: none; padding: {f(12)}px; border-radius: {f(9)}px; font-weight: 600; }}
+    #newChatBtn:hover {{ background: #5357B5; }}
+    #searchBox {{ padding: {f(10)}px; font-size: {f(12)}px; }}
+    #searchBox:focus {{ border-color: {c['accent']}; color: {c['text']}; }}
+    #sideTab {{ padding: {f(10)}px; font-weight: 600; }}
+    #sideTab:checked {{ background: {c['elevated']}; border-bottom: none;
+        border-radius: {f(7)}px; color: {c['accent']}; }}
+    #filterChip {{ padding: {f(5)}px {f(8)}px; border: none; text-align: left; }}
+    #filterChip:checked {{ background: {c['avatar_bg']}; color: {c['avatar_fg']}; }}
+    QTreeWidget::item {{ padding: {f(8)}px 2px; }}
+    #workspaceCard {{ background: {c['elevated']}; border: 1px solid {c['border']};
+        border-radius: {f(10)}px; padding: {f(14)}px {f(10)}px;
+        color: {c['text2']}; text-align: left; font-size: {f(12)}px; }}
+    #workspaceCard:hover {{ border-color: {c['accent']}; color: {c['text']}; }}
+    #chatTitle {{ font-size: {f(16)}px; }}
+    #chatSub {{ color: {c['text3']}; padding-top: {f(4)}px; }}
+    #stateBadge {{ background: {c['avatar_bg']}; color: {c['avatar_fg']};
+        border-radius: {f(10)}px; padding: {f(5)}px {f(10)}px; font-size: {f(11)}px; }}
+    #welcomeEyebrow {{ color: {c['accent']}; font-size: {f(12)}px; font-weight: 600; }}
+    #welcomeTitle {{ color: {c['text']}; font-size: {f(30)}px; font-weight: 700; }}
+    #welcomeSub {{ color: {c['text2']}; font-size: {f(13)}px; line-height: 1.7; }}
+    #promptCard {{ background: {c['elevated']}; border: 1px solid {c['border']};
+        border-radius: {f(12)}px; padding: {f(16)}px; text-align: left;
+        color: {c['text2']}; font-size: {f(12)}px; }}
+    #promptCard:hover {{ border-color: {c['accent']}; background: {c['hover']}; color: {c['text']}; }}
+    #promptCard:focus {{ border-color: {c['accent']}; }}
+    #promptTitle {{ color: {c['text']}; font-size: {f(13)}px; font-weight: 600; }}
+    #promptDetail {{ color: {c['text2']}; font-size: {f(11)}px; }}
+    QFrame#inputCard {{ border-radius: {f(16)}px; }}
+    #inputBox {{ font-size: {f(14)}px; selection-background-color: {c['accent']}; }}
+    #inputActionBtn {{ border: none; padding: {f(5)}px; border-radius: {f(6)}px; }}
+    QComboBox#agentCombo {{ padding: {f(5)}px {f(10)}px; }}
+    #sendBtn {{ background: {c['send_bg']}; border: none; border-radius: {f(10)}px; }}
+    #sendBtn:hover {{ background: {c['accent']}; }}
+    #statusLabel {{ font-size: {f(11)}px; color: {c['text3']}; }}
+    QLabel#userBubble {{ padding: {f(12)}px {f(16)}px; border-radius: {f(14)}px; }}
+    QDialog QLineEdit, QDialog QComboBox {{ background: {c['input_bg']};
+        border: 1px solid {c['input_border']}; border-radius: {f(6)}px;
+        padding: {f(8)}px; selection-background-color: {c['accent']}; }}
+    QDialog QLineEdit:focus, QDialog QComboBox:focus {{ border-color: {c['accent']}; }}
+    QDialog QPushButton {{ background: {c['elevated']}; border: 1px solid {c['border']};
+        border-radius: {f(6)}px; padding: {f(8)}px {f(16)}px; }}
+    QDialog QPushButton:hover {{ border-color: {c['accent']}; }}
+    QDialog QPushButton:default {{ background: {c['accent']}; color: {c['accent_text']}; }}
+    QDialog QCheckBox {{ spacing: {f(8)}px; padding: {f(4)}px 0; }}
     """

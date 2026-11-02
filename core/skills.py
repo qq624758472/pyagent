@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.log import get_logger
+from core.runtime import DATA_ROOT, RESOURCE_ROOT, BACKGROUND_FLAGS
 
 log = get_logger("core.skills")
 
@@ -158,12 +159,14 @@ def skill_roots(cfg=None, ws=None) -> list:
 
     顺序即优先级（后者覆盖同名者）：project > workspace > global
     """
-    project = Path(__file__).resolve().parent.parent
+    project = DATA_ROOT
     roots = [
         (project / "skills", "project"),
         (project / ".agents" / "skills", "project"),
         (project / ".claude" / "skills", "project"),
     ]
+    if RESOURCE_ROOT != DATA_ROOT:
+        roots.insert(0, (RESOURCE_ROOT / "skills", "bundled"))
     if ws is not None:
         try:
             roots.append((Path(ws.root) / ".pyagent" / "skills", "workspace"))
@@ -597,14 +600,15 @@ def install_from_git(url: str, subdir: str = "", dest_root=None,
     url = (url or "").strip()
     if not url:
         return {"ok": False, "message": "未提供仓库地址", "path": "", "name": ""}
-    project = Path(__file__).resolve().parent.parent
+    project = DATA_ROOT
     dest_root = Path(dest_root) if dest_root else project / "skills"
     dest_root.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="skill_install_"))
     try:
         log.info("安装技能: git clone %s", url)
         r = subprocess.run(["git", "clone", "--depth", "1", url, str(tmp / "repo")],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, creationflags=BACKGROUND_FLAGS)
         if r.returncode != 0:
             err = (r.stderr or "").strip()[-300:]
             return {"ok": False, "message": f"git clone 失败: {err}",

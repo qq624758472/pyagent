@@ -16,6 +16,7 @@ from pathlib import Path
 
 from core.tools import ConfirmRequired, tool
 from core.workspace import WorkspaceError
+from core.runtime import python_command, BACKGROUND_FLAGS
 
 _lock = threading.RLock()
 _processes = {}
@@ -32,7 +33,7 @@ def _script(ws, path):
 
 def _argv(path, args):
     try:
-        return [sys.executable, "-u", str(path)] + shlex.split(str(args or ""), posix=os.name != "nt")
+        return python_command(path) + shlex.split(str(args or ""), posix=os.name != "nt")
     except ValueError as exc:
         raise ValueError(f"参数格式错误: {exc}") from exc
 
@@ -44,7 +45,7 @@ def _spawn(ws, target, args=""):
         proc = subprocess.Popen(
             _argv(target, args), cwd=str(ws.root), env=env,
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags=(BACKGROUND_FLAGS | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
             if os.name == "nt" else 0)
     except Exception:
         output.close()
@@ -210,7 +211,8 @@ def tcp_echo_test(ws, cfg, server_path="tcp_server.py", client_path="",
                     run = subprocess.run(
                         _argv(client, ""), input=f"{message}\nquit\n",
                         cwd=str(ws.root), env=env, capture_output=True,
-                        text=True, encoding="utf-8", errors="replace", timeout=7)
+                        text=True, encoding="utf-8", errors="replace", timeout=7,
+                        creationflags=BACKGROUND_FLAGS)
                 except subprocess.TimeoutExpired:
                     return (f"错误: 第 {attempt}/3 次测试客户端超时，"
                             "请提供可自动测试的非交互模式")

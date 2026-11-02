@@ -7,6 +7,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+if __name__ == "__main__":
+    from core.runtime import initialize_stdio
+    initialize_stdio()
+    from multiprocessing import freeze_support
+    freeze_support()
+    if len(sys.argv) > 1 and sys.argv[1] == "--run-python":
+        from core.runtime import run_python_worker
+        try:
+            run_python_worker()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(1)
+        raise SystemExit(0)
+
 from core.config import Config
 from core.log import setup_logging, LOG_FILE, config_snapshot
 from core.workspace import Workspace, WorkspaceError

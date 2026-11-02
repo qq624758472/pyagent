@@ -4,10 +4,14 @@ Python 3.10+ 实现的 ReAct Agent，支持**图形界面（PyQt5）与控制台
 可**挂载工作区**执行文件任务、**知识库检索**、**联网采集数据**（多引擎 + 筛选模型
 自动过滤）。核心逻辑与 UI 完全解耦，两种模式共用同一套 `core/`。
 
-界面仿 Reasonix Studio：左侧栏（Logo / 新建会话 / 搜索框 / 会话树 / 用户区）+
-主聊天区（右对齐用户气泡、带头像的助手消息、可折叠「执行过程」工具卡）+
-大圆角输入卡（圆形发送按钮），内置**暗色 / 亮色两套主题**（顶栏 ☀/🌙 一键切换，
-持久化保存）。
+桌面界面采用统一的 Studio 设计：石墨蓝 / 云白两套主题、鸢尾紫强调色、
+线性图标与卡片式布局。欢迎页提供整理工作区、读懂代码、主题研究和文档起草
+四个任务入口，点击后填入可编辑的提示词。侧栏整合会话搜索、筛选和工作区入口；
+对话区支持流式回复、Markdown 和可折叠执行过程，大窗口下限制阅读宽度。
+顶栏可一键切换主题并保存，详细运行信息可悬停查看底部状态栏。
+
+运行 `python scripts/preview_ui.py` 可离屏生成深色、浅色、对话及小窗口截图，
+输出到 `artifacts/`，不会读取或修改用户会话。
 
 - **文字可复制**：消息区所有文字（用户气泡、助手正文、工具调用、观察结果、
   系统提示）均可鼠标拖选 / `Ctrl+C` / 右键「复制」
@@ -30,6 +34,35 @@ python main.py -c              # 控制台 REPL
 python main.py --task "整理工作区里的 .py 文件清单"   # 单次任务（跑完退出）
 python main.py -w D:\docs\kb   # 启动时直接挂载工作区
 ```
+
+## Windows 单文件 EXE
+
+双击 `dist/PyAgent.exe` 启动新版界面，无需另外安装 Python。
+首次使用请在设置中填写模型服务地址、API Key 和模型名称；程序不包含模型权重，
+需要能够连接配置的模型服务。
+
+将 EXE 放在一个可写的独立文件夹中。配置 `config.json`、会话 `sessions/`、
+日志 `logs/` 保存在 EXE 旁边，重启后保留。内置技能与图标封装在 EXE 内；
+自定义技能可放在 EXE 旁的 `skills/` 中。分发给其他人时仅复制原始 EXE，
+不要附带使用后产生的配置、会话或日志。
+
+内置 Python 可运行常见标准库脚本以及程序已包含的依赖；额外的第三方库
+需要在构建时添加，不能把这个 EXE 当作完整的 Python 开发环境。
+Shell 命令、Git 等外部工具仍依赖目标电脑上安装的对应程序。
+
+重新构建（Windows，Python 3.10+）：
+
+```powershell
+python -m pip install -e ".[build]"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_exe.ps1
+python scripts/smoke_exe.py
+```
+
+打包配置 `PyAgent.spec` 只收集代码、图标、内置技能与许可证，
+不会收集本地密钥、聊天记录、日志或挂载的工作区。
+EXE 使用原生 Windows 窗口模式，双击直接打开界面，不创建控制台窗口。
+后台 Python、Shell 和 Git 操作也不弹出控制台；执行结果显示在界面中。
+控制台交互模式可通过源码入口 `python main.py -c` 使用。
 
 控制台命令：`/mount <路径>`、`/unmount`、`/reset`、`/tools`、`/skills`、
 `/key <API_KEY>`、`/models`、`/model <名称>`、`/web [on|off]`、`/exit`。

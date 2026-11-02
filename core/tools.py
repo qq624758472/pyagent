@@ -254,8 +254,10 @@ def _run_command(ws, cfg, command="", _confirmed=False):
     if not _confirmed:
         raise ConfirmRequired(f"执行 shell 命令: {str(command)[:120]}")
     try:
+        from core.runtime import BACKGROUND_FLAGS
         r = subprocess.run(command, shell=True, cwd=str(ws.root),
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, creationflags=BACKGROUND_FLAGS)
         out = ((r.stdout or "") + (r.stderr or ""))[:4000]
         return f"exit_code={r.returncode}\n{out or '(无输出)'}"
     except subprocess.TimeoutExpired:
@@ -440,7 +442,8 @@ def _run_python(ws, cfg, path, args="", _progress=None, _confirmed=False):
     # 分词：Windows 模型常给反斜杠路径（data\x.txt），shlex 会把 \ 当
     # 转义符吃掉 → 先归一为正斜杠再分词，两侧写法都能对上同一文件
     try:
-        argv = [sys.executable, str(target)] + shlex.split(
+        from core.runtime import python_command
+        argv = python_command(target) + shlex.split(
             str(args or "").replace("\\", "/"))
     except ValueError:
         return "错误: args 参数格式非法（无法分词）"
@@ -448,10 +451,11 @@ def _run_python(ws, cfg, path, args="", _progress=None, _confirmed=False):
     # 使用 UTF-8 + communicate：避免 Windows GBK 输出解码失败，以及 stdout/stderr
     # 管道写满时 poll()+read() 相互等待。短脚本不再固定等待 5 秒。
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+    from core.runtime import BACKGROUND_FLAGS
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             stderr=subprocess.PIPE, text=True,
                             encoding="utf-8", errors="replace",
-                            env=env, cwd=str(ws.root))
+                            env=env, cwd=str(ws.root), creationflags=BACKGROUND_FLAGS)
     t0 = time.monotonic()
     last_progress = t0
     while True:

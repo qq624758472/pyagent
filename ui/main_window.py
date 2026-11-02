@@ -1,5 +1,4 @@
-"""PyQt5 图形界面（仿 Reasonix Studio 外观）：三段式布局 + 暗色/亮色主题
-与控制台共用同一套 Agent 核心；视觉规格对齐 Reasonix Studio 官方截图"""
+"""PyAgent Studio 桌面界面，与控制台共用同一套 Agent 核心。"""
 import html
 import json
 import os
@@ -9,11 +8,11 @@ import sys
 import threading
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QEvent, QTimer, QSize, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QIcon, QKeySequence
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog,
-                             QFormLayout, QFrame, QGridLayout, QHBoxLayout,
+                             QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLayout,
                              QHeaderView, QLabel, QLineEdit, QMainWindow,
                              QMessageBox, QPlainTextEdit, QPushButton,
                              QScrollArea, QMenu, QShortcut, QStackedWidget,
@@ -22,6 +21,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
 
 from core.agent import Agent
 from core.config import PROJECT_ROOT
+from core.runtime import RESOURCE_ROOT
 from core.llm_client import LLMClient
 from core.log import get_logger, config_snapshot
 from core.sessions import (delete_session, filter_sessions, list_sessions,
@@ -30,6 +30,7 @@ from core.sessions import (delete_session, filter_sessions, list_sessions,
 from core.workspace import Workspace, WorkspaceError
 from ui.theme import THEMES, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, build_qss
 from ui.workers import AgentWorker, FetchModelsWorker
+from ui.icons import line_icon
 
 log = get_logger("ui.main_window")
 
@@ -135,7 +136,7 @@ class SettingsDialog(QDialog):
         self.config = config
         self._models_worker = None
         self.setWindowTitle("设置")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(620)
         self._status = QLabel("")
         self._status.setWordWrap(True)
 
@@ -233,6 +234,12 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(18)
+        heading = QLabel("配置你的工作助手", self)
+        heading.setObjectName("settingsTitle")
+        layout.addWidget(heading)
+        form.setVerticalSpacing(12)
         layout.addLayout(form)
         layout.addWidget(self._status)
         layout.addWidget(buttons)
@@ -521,9 +528,11 @@ class MainWindow(QMainWindow):
         self.confirm_signal.connect(self._on_confirm_dialog)
 
         self.setWindowTitle("PyAgent Studio")
+        self.setMinimumSize(920, 680)
+        self._icon_buttons = []
         self.resize(int(1200 * min(self.ui_scale, 1.4)),
                     int(820 * min(self.ui_scale, 1.4)))
-        icon_path = PROJECT_ROOT / "icons" / "app.png"
+        icon_path = RESOURCE_ROOT / "icons" / "app.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -536,12 +545,11 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
         log.info("界面已就绪: %s", config_snapshot(config))
 
-        self._append_sys(
-            "欢迎使用 PyAgent Studio —— 输入任务开始。挂载工作区后 Agent "
-            "可读写其中的文件（越界路径会被拒绝）。")
-        self._append_sys(
-            "提示：Ctrl + 鼠标滚轮 缩放界面（70%–250%），Ctrl+0 复位到默认（最大）。"
-            "消息文字可选中复制。")
+    def _set_icon(self, button, name, primary=False):
+        self._icon_buttons.append((button, name, primary))
+        button.setText("")
+        button.setAccessibleName(button.toolTip() or name)
+
 
     # ---------- 布局 ----------
     def _build_ui(self):
@@ -556,22 +564,23 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self):
         side = QWidget(self)
         side.setObjectName("sidebar")
-        side.setFixedWidth(self._px(268))
+        self.sidebar = side
+        side.setFixedWidth(self._px(272))
         v = QVBoxLayout(side)
-        v.setContentsMargins(12, 14, 12, 10)
-        v.setSpacing(8)
+        v.setContentsMargins(18, 24, 18, 18)
+        v.setSpacing(14)
 
         logo_row = QHBoxLayout()
         logo_row.setSpacing(8)
         badge = QLabel("P", side)
-        badge.setObjectName("avatar")
-        badge.setFixedSize(self._px(30), self._px(30))
+        badge.setObjectName("brandBadge")
+        badge.setFixedSize(self._px(38), self._px(38))
         badge.setAlignment(Qt.AlignCenter)
         name_box = QVBoxLayout()
         name_box.setSpacing(0)
         name = QLabel("PyAgent", side)
         name.setObjectName("logoName")
-        sub = QLabel("STUDIO", side)
+        sub = QLabel("S T U D I O", side)
         sub.setObjectName("logoSub")
         name_box.addWidget(name)
         name_box.addWidget(sub)
@@ -580,7 +589,9 @@ class MainWindow(QMainWindow):
         logo_row.addStretch(1)
         v.addLayout(logo_row)
 
-        self.b_new = QPushButton("＋  新建会话      Alt K", side)
+        self.b_new = QPushButton("＋   新建会话", side)
+        self.b_new.setShortcut(QKeySequence("Alt+K"))
+        self.b_new.setToolTip("新建会话 · Alt+K")
         self.b_new.setObjectName("newChatBtn")
         self.b_new.setCursor(Qt.PointingHandCursor)
         self.b_new.clicked.connect(self.new_chat)
@@ -588,7 +599,8 @@ class MainWindow(QMainWindow):
 
         self.search = QLineEdit(side)
         self.search.setObjectName("searchBox")
-        self.search.setPlaceholderText("🔍  搜索会话（标题/内容）  Ctrl K")
+        self.search.setPlaceholderText("搜索会话…      Ctrl K")
+        self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_search_changed)
         self.search.returnPressed.connect(self._on_search_enter)
         v.addWidget(self.search)
@@ -621,7 +633,7 @@ class MainWindow(QMainWindow):
             chip.setToolTip(tip)
             chip.clicked.connect(lambda _=False, m=mode: self._set_session_filter(m))
             self._chips[mode] = chip
-            chip_row.addWidget(chip, 0, i)
+            chip_row.addWidget(chip, i // 2, i % 2)
         self._chips["all"].setChecked(True)
         v.addLayout(chip_row)
 
@@ -645,17 +657,23 @@ class MainWindow(QMainWindow):
 
         v.addWidget(self.side_stack, 1)
 
+        self.workspace_button = QPushButton("选择工作区  ↗", side)
+        self.workspace_button.setObjectName("workspaceCard")
+        self.workspace_button.setCursor(Qt.PointingHandCursor)
+        self.workspace_button.clicked.connect(self.mount_workspace)
+        v.addWidget(self.workspace_button)
+
         user_row = QHBoxLayout()
         user_row.setSpacing(8)
-        av = QLabel("pyagent", side)
+        av = QLabel("P", side)
         av.setObjectName("avatar")
         av.setFixedSize(self._px(30), self._px(30))
         av.setAlignment(Qt.AlignCenter)
         ub = QVBoxLayout()
         ub.setSpacing(0)
-        un = QLabel("本地 · 工作区智能助手", side)
+        un = QLabel("本地工作空间", side)
         un.setObjectName("userName")
-        up = QLabel("Python 3.10+", side)
+        up = QLabel("PyAgent Desktop", side)
         up.setObjectName("userPlan")
         ub.addWidget(un)
         ub.addWidget(up)
@@ -664,6 +682,7 @@ class MainWindow(QMainWindow):
         gear.setCursor(Qt.PointingHandCursor)
         gear.setFixedSize(self._px(30), self._px(30))
         gear.setToolTip("设置")
+        self._set_icon(gear, "settings")
         gear.clicked.connect(self.open_settings)
         user_row.addWidget(av)
         user_row.addLayout(ub, 1)
@@ -720,19 +739,22 @@ class MainWindow(QMainWindow):
         header = QWidget(main)
         header.setObjectName("header")
         hv = QHBoxLayout(header)
-        hv.setContentsMargins(16, 9, 14, 9)
-        hv.setSpacing(6)
+        hv.setContentsMargins(28, 18, 24, 18)
+        hv.setSpacing(10)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
-        t = QLabel("PyAgent", header)
+        t = QLabel("智能工作台", header)
         t.setObjectName("chatTitle")
-        self.title_sub = QLabel("就绪", header)
+        self.title_sub = QLabel("从想法到完成，每一步都有助手", header)
         self.title_sub.setObjectName("chatSub")
         title_box.addWidget(t)
         title_box.addWidget(self.title_sub)
         hv.addLayout(title_box)
         hv.addStretch(1)
+        self.state_badge = QLabel("● 就绪", header)
+        self.state_badge.setObjectName("stateBadge")
+        hv.addWidget(self.state_badge)
 
         for text, tip, fn in (
                 ("✚", "新建会话", self.new_chat),
@@ -743,7 +765,7 @@ class MainWindow(QMainWindow):
             b.setObjectName("iconBtn")
             b.setCursor(Qt.PointingHandCursor)
             b.setToolTip(tip)
-            b.setFixedSize(self._px(30), self._px(28))
+            b.setFixedSize(self._px(34), self._px(34))
             b.clicked.connect(fn)
             if text == "🌙":
                 self.b_theme = b
@@ -753,6 +775,7 @@ class MainWindow(QMainWindow):
                 self.b_h_new = b
             else:
                 self.b_h_mount = b
+            self._set_icon(b, {"✚": "plus", "📂": "folder", "🌙": "moon", "⚙": "settings"}[text])
             hv.addWidget(b)
         v.addWidget(header)
 
@@ -763,27 +786,32 @@ class MainWindow(QMainWindow):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         chat_host = QWidget(self.scroll)
         self.chat_v = QVBoxLayout(chat_host)
-        self.chat_v.setContentsMargins(20, 14, 20, 14)
-        self.chat_v.setSpacing(10)
+        self.chat_v.setContentsMargins(36, 28, 36, 28)
+        self.chat_v.setSpacing(20)
         self.chat_v.addStretch(1)
         self.scroll.setWidget(chat_host)
-        v.addWidget(self.scroll, 1)
+        self.content_stack = QStackedWidget(main)
+        self.content_stack.addWidget(self._build_welcome())
+        self.content_stack.addWidget(self.scroll)
+        v.addWidget(self.content_stack, 1)
 
         # 输入卡
         input_wrap = QWidget(main)
         iw_v = QVBoxLayout(input_wrap)
-        iw_v.setContentsMargins(20, 6, 20, 10)
-        iw_v.setSpacing(4)
+        self.input_layout = iw_v
+        iw_v.setContentsMargins(32, 8, 32, 18)
+        iw_v.setSpacing(10)
 
         card = QFrame(input_wrap)
         card.setObjectName("inputCard")
         card_v = QVBoxLayout(card)
-        card_v.setContentsMargins(12, 8, 12, 8)
-        card_v.setSpacing(4)
+        card_v.setContentsMargins(18, 14, 18, 12)
+        card_v.setSpacing(10)
 
         self.input = InputBox(card)
         self.input.setObjectName("inputBox")
-        self.input.setPlaceholderText("输入任务，Enter 发送 / Shift+Enter 换行…")
+        self.input.setPlaceholderText("描述你的任务，让 PyAgent 帮你完成…")
+        self.input.setAccessibleName("任务输入框")
         self.input.setFixedHeight(self._px(64))
         self.input.submitted.connect(self._on_send_clicked)
         card_v.addWidget(self.input)
@@ -794,11 +822,13 @@ class MainWindow(QMainWindow):
         self.b_plus.setObjectName("inputActionBtn")
         self.b_plus.setCursor(Qt.PointingHandCursor)
         self.b_plus.setToolTip("工作区快捷操作")
+        self._set_icon(self.b_plus, "plus")
         self.b_plus.clicked.connect(self._show_plus_menu)
         self.b_star = QPushButton("✦", card)
         self.b_star.setObjectName("inputActionBtn")
         self.b_star.setCursor(Qt.PointingHandCursor)
         self.b_star.setToolTip("会话快捷操作")
+        self._set_icon(self.b_star, "spark")
         self.b_star.clicked.connect(self._show_star_menu)
         action_row.addWidget(self.b_plus)
         action_row.addWidget(self.b_star)
@@ -821,7 +851,8 @@ class MainWindow(QMainWindow):
 
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(6)
-        hint = QLabel("PyAgent 可能会读写工作区文件 · 请核对重要操作", card)
+        hint = QLabel("Enter 发送  ·  Shift + Enter 换行", card)
+        hint.setToolTip("Agent 可读写已挂载工作区的文件，请核对重要操作。Ctrl + 滚轮缩放界面，Ctrl+0 复位。")
         hint.setObjectName("hintLabel")
         self.hint = hint
         bottom_row.addWidget(hint)
@@ -830,7 +861,8 @@ class MainWindow(QMainWindow):
         self.b_send.setObjectName("sendBtn")
         self.b_send.setCursor(Qt.PointingHandCursor)
         self.b_send.setToolTip("发送")
-        self.b_send.setFixedSize(self._px(34), self._px(30))
+        self._set_icon(self.b_send, "arrow", True)
+        self.b_send.setFixedSize(self._px(40), self._px(36))
         self.b_send.clicked.connect(self._on_send_clicked)
         bottom_row.addWidget(self.b_send)
         card_v.addLayout(bottom_row)
@@ -842,14 +874,119 @@ class MainWindow(QMainWindow):
         v.addWidget(input_wrap)
         return main
 
+    def _build_welcome(self):
+        page = QWidget(self)
+        outer = QVBoxLayout(page)
+        outer.setSizeConstraint(QLayout.SetMinimumSize)
+        outer.setContentsMargins(32, 16, 32, 16)
+        outer.addStretch(1)
+        panel = QWidget(page)
+        panel.setMaximumWidth(760)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        mark = QLabel("P", panel)
+        self.welcome_mark = mark
+        mark.setObjectName("welcomeMark")
+        mark.setFixedSize(56, 56)
+        mark.setAlignment(Qt.AlignCenter)
+        layout.addWidget(mark, 0, Qt.AlignHCenter)
+        eyebrow = QLabel("你的 AI 工作伙伴", panel)
+        self.welcome_eyebrow = eyebrow
+        eyebrow.setObjectName("welcomeEyebrow")
+        eyebrow.setAlignment(Qt.AlignCenter)
+        layout.addWidget(eyebrow)
+        title = QLabel("让繁杂的工作，简单一点。", panel)
+        title.setObjectName("welcomeTitle")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        subtitle = QLabel("整理文件、探索代码、搜集信息。\n告诉我目标，我们一起把它变成结果。", panel)
+        subtitle.setObjectName("welcomeSub")
+        subtitle.setAlignment(Qt.AlignCenter)
+        layout.addWidget(subtitle)
+        layout.addSpacing(12)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        prompts = (
+            ("folder", "整理工作区", "梳理文件结构，快速了解项目", "请先查看当前工作区的文件结构，梳理项目组成并给出整理建议，暂时不要修改文件。"),
+            ("code", "读懂代码", "理解实现逻辑，发现改进方向", "请分析当前工作区的代码，说明项目入口、核心模块与运行方式，并给出改进建议。"),
+            ("globe", "研究一个主题", "搜集公开信息，提炼关键结论", "我想研究一个主题，请先询问我的研究方向和范围，再帮我搜集资料并注明来源。"),
+            ("file", "起草一份文档", "从零开始，写出清晰的初稿", "请帮我起草一份文档。先询问文档主题、目标读者与篇幅，再开始写作。"),
+        )
+        self._prompt_icons = []
+        for i, (icon, heading, detail, prompt) in enumerate(prompts):
+            button = QPushButton(panel)
+            button.setObjectName("promptCard")
+            button.setAccessibleName(heading)
+            button.setMinimumHeight(82)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip("将任务填入输入框，可编辑后发送")
+            row = QHBoxLayout(button)
+            row.setContentsMargins(16, 12, 16, 12)
+            row.setSpacing(12)
+            icon_label = QLabel(button)
+            icon_label.setFixedSize(22, 22)
+            self._prompt_icons.append((icon_label, icon))
+            row.addWidget(icon_label)
+            words = QVBoxLayout()
+            words.setSpacing(5)
+            name = QLabel(heading, button)
+            name.setObjectName("promptTitle")
+            description = QLabel(detail, button)
+            description.setObjectName("promptDetail")
+            words.addWidget(name)
+            words.addWidget(description)
+            row.addLayout(words, 1)
+            for label in (icon_label, name, description):
+                label.setAttribute(Qt.WA_TransparentForMouseEvents)
+            button.clicked.connect(lambda _=False, p=prompt: self._use_prompt(p))
+            grid.addWidget(button, i // 2, i % 2)
+        layout.addLayout(grid)
+        center = QHBoxLayout()
+        center.addStretch(1)
+        center.addWidget(panel, 8)
+        center.addStretch(1)
+        outer.addLayout(center)
+        outer.addStretch(1)
+        welcome_scroll = QScrollArea(self)
+        welcome_scroll.setObjectName("welcomeScroll")
+        welcome_scroll.setWidgetResizable(True)
+        welcome_scroll.setFrameShape(QFrame.NoFrame)
+        welcome_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        welcome_scroll.setWidget(page)
+        return welcome_scroll
+
+    def _use_prompt(self, prompt):
+        self.input.setPlainText(prompt)
+        self.input.setFocus()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "input_layout"):
+            roomy = self.height() >= self._px(740)
+            self.welcome_mark.setVisible(roomy)
+            self.welcome_eyebrow.setVisible(roomy)
+            width = self.width() - self.sidebar.width()
+            margin = max(self._px(32), (width - self._px(960)) // 2)
+            self.input_layout.setContentsMargins(margin, 8, margin, 18)
+            self.chat_v.setContentsMargins(margin, 28, margin, 28)
+
     # ---------- 主题与缩放 ----------
     def _apply_theme(self):
         colors = THEMES.get(self.config.theme, THEMES["dark"])
         self._c = colors
         self.setStyleSheet(build_qss(colors, self.ui_scale))
+        for label, name in self._prompt_icons:
+            label.setPixmap(line_icon(name, colors["accent"]).pixmap(22, 22))
+        for button, name, primary in self._icon_buttons:
+            if button is getattr(self, "b_theme", None):
+                name = "sun" if self.config.theme == "dark" else "moon"
+            if button is getattr(self, "b_send", None):
+                name = "stop" if self._busy else "arrow"
+            button.setIcon(line_icon(name, colors["accent_text"] if primary else colors["text2"]))
+            button.setIconSize(QSize(self._px(18), self._px(18)))
         if hasattr(self, "b_theme"):
             is_dark = self.config.theme == "dark"
-            self.b_theme.setText("☀" if is_dark else "🌙")
             self.b_theme.setToolTip("切换为亮色" if is_dark else "切换为暗色")
 
     def _px(self, n):
@@ -907,7 +1044,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "input"):
             self.input.setFixedHeight(self._px(64))
         if hasattr(self, "b_send"):
-            self.b_send.setFixedSize(self._px(34), self._px(30))
+            self.b_send.setFixedSize(self._px(40), self._px(36))
+        if hasattr(self, "sidebar"):
+            self.sidebar.setFixedWidth(self._px(272))
 
     def _relayout_streams(self):
         """缩放后按新字号重算历史消息块高度"""
@@ -951,6 +1090,7 @@ class MainWindow(QMainWindow):
         self._add_widget(lab)
 
     def _append_user(self, text):
+        self.content_stack.setCurrentIndex(1)
         row = QWidget(self)
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 2, 0, 2)
@@ -965,6 +1105,7 @@ class MainWindow(QMainWindow):
         self._add_widget(row)
 
     def _start_assistant(self, meta=""):
+        self.content_stack.setCurrentIndex(1)
         row = QWidget(self)
         v = QVBoxLayout(row)
         v.setContentsMargins(0, 2, 0, 2)
@@ -976,7 +1117,7 @@ class MainWindow(QMainWindow):
         av.setObjectName("assistAvatar")
         av.setFixedSize(self._px(26), self._px(26))
         av.setAlignment(Qt.AlignCenter)
-        nm = QLabel("pyagent", row)
+        nm = QLabel("PyAgent", row)
         nm.setObjectName("assistName")
         head.addWidget(av)
         head.addWidget(nm)
@@ -1091,7 +1232,7 @@ class MainWindow(QMainWindow):
         self._busy = False
         self.watchdog.stop()
         if hasattr(self, "b_send"):
-            self.b_send.setText("↑")
+            self.b_send.setIcon(line_icon("arrow", self._c["accent_text"]))
             self.b_send.setToolTip("发送")
         if self._stream_view is not None:
             self._finish_assistant()
@@ -1131,7 +1272,7 @@ class MainWindow(QMainWindow):
         self._start_assistant(f"第 {self._rounds} 轮")
         self._busy = True
         self.title_sub.setText("运行中…")
-        self.b_send.setText("■")
+        self.b_send.setIcon(line_icon("stop", self._c["accent_text"]))
         self.b_send.setToolTip("停止")
         self._refresh_status()
 
@@ -1452,6 +1593,7 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         self._stream_view = None
         self._tool_card = None
+        self.content_stack.setCurrentIndex(0)
 
     def _show_plus_menu(self):
         """＋ 按钮：工作区快捷操作"""
@@ -1612,7 +1754,18 @@ class MainWindow(QMainWindow):
         text = (f"▣ {ws} · {key} · {run} · 模式: {mode} · 协议: {proto}"
                 f" · 模型: {model}{skills} · 主题: {self.config.theme}")
         if hasattr(self, "status_label"):
-            self.status_label.setText(text)
+            self.status_label.setText(
+                f"{'执行中' if self._busy else '准备就绪'}  ·  {mode} 模式"
+                f"  ·  {'工作区已连接' if self.agent.workspace else '连接工作区以处理本地文件'}")
+            self.status_label.setToolTip(text)
+        if hasattr(self, "state_badge"):
+            self.state_badge.setText("● 执行中" if self._busy else (
+                "● 就绪" if self.config.configured else "○ 待配置"))
+        if hasattr(self, "workspace_button"):
+            root = self.agent.workspace.root if self.agent.workspace else None
+            self.workspace_button.setText(
+                f"工作区 · {Path(root).name[:20]}  ↗" if root else "连接工作区  ↗")
+            self.workspace_button.setToolTip(str(root) if root else "选择一个本地文件夹，开始处理文件任务")
         if hasattr(self, "model_label"):
             self.model_label.setText(f"模型 {model}")
         if hasattr(self, "agent_combo"):
@@ -1648,7 +1801,7 @@ class MainWindow(QMainWindow):
             shown = hit
 
         root = QTreeWidgetItem(self.tree)
-        label = f"🕘 历史会话 · {len(shown)}" if shown else "🕘 历史会话"
+        label = f"历史会话 · {len(shown)}" if shown else "历史会话"
         root.setText(0, label)
         root.setData(0, Qt.UserRole, ("root", ""))
         root.setExpanded(True)
@@ -1702,7 +1855,7 @@ class MainWindow(QMainWindow):
         rounds = sum(1 for m in self.agent.messages
                      if m.get("role") == "user"
                      and not str(m.get("content") or "").startswith("OBSERVATION"))
-        cur.setText(0, f"💬 当前会话 · {rounds} 轮" if rounds else "💬 当前会话")
+        cur.setText(0, f"当前会话 · {rounds} 轮" if rounds else "当前会话")
         cur.setData(0, Qt.UserRole, ("current", ""))
         cur.setToolTip(0, "双击聚焦输入框")
         self._update_chip_counts()

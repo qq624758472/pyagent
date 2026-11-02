@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 # 开发/测试：测试套件本身零依赖（桩 + 离屏 Qt），此处仅便于本地一键装齐
 dev = ["pytest>=7.0"]
+build = ["pyinstaller>=6.22.1,<7", "Pillow>=10"]
 
 [tool.setuptools]
 packages = ["core", "ui"]

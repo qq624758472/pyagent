@@ -14,11 +14,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from core.log import get_logger
+from core.runtime import DATA_ROOT
 
 log = get_logger("core.config")
 
 # 工程根目录 = core/ 的上级（配置随工程走，不随启动目录/用户变化）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = DATA_ROOT
 CONFIG_DIR = PROJECT_ROOT
 CONFIG_FILE = PROJECT_ROOT / "config.json"
 _LEGACY_FILE = Path.home() / ".pyagent" / "config.json"   # 旧版位置（迁移源）

@@ -24,3 +24,7 @@ agent测试目录/
 
 # 评测产物（每次运行都会变）
 tests/eval_*.json
+
+# Windows 打包输出
+build/
+dist/
