@@ -23,6 +23,7 @@ SUITES = [
     ("test_protocol_nudge.py", False),      # 协议追问闭环（文本协议）
     ("test_native_protocol.py", False),     # 原生 function calling 协议
     ("test_agent_quality.py", False),        # 小模型：历史/工具调用完整性与回退
+    ("test_autonomous_loop.py", False),      # 小模型自主编码：失败去重/测试闭环
     ("test_skills.py", False),              # 技能系统：发现/披露/工具/安全/集成
     ("test_web_collect.py", False),         # 联网采集：长任务心跳 / 可中断 / 预算
     ("test_session_delete.py", True),       # 会话删除（离屏 Qt）

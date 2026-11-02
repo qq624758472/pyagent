@@ -139,8 +139,8 @@ ev = list(ag.run("思考型回复"))
 kinds = [e["type"] for e in ev]
 check("推理期间产生 keepalive 事件（喂看门狗）",
       kinds.count("keepalive") >= 5, str(kinds))
-check("reasoning 最终仍能作为回答兜底",
-      "answer" in kinds, str(kinds))
+check("原生协议不把内部 reasoning 当作最终答案泄漏",
+      "answer" not in kinds and "error" in kinds, str(kinds))
 
 
 # ---------------- C. UI 文本块高度自适应 ----------------

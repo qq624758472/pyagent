@@ -1,4 +1,5 @@
 """工具注册表：Agent 可调用的原子能力"""
+import os
 import inspect
 import json
 import re
@@ -109,6 +110,19 @@ TOOL_SCHEMAS = {
     "run_python": _schema({
         "path": ("string", "工作区内 .py 脚本相对路径，如 calc.py"),
         "args": ("string", "传给脚本的命令行参数，空格分隔，可省略")}),
+    "start_process": _schema({
+        "path": ("string", "工作区内常驻 .py 服务脚本"),
+        "args": ("string", "传给脚本的可选命令行参数")}, ["path"]),
+    "process_status": _schema({
+        "process_id": ("string", "start_process 返回的进程 ID")}, ["process_id"]),
+    "stop_process": _schema({
+        "process_id": ("string", "start_process 返回的进程 ID")}, ["process_id"]),
+    "tcp_echo_test": _schema({
+        "server_path": ("string", "工作区服务器脚本，默认 tcp_server.py"),
+        "client_path": ("string", "可选，工作区客户端脚本；填写则同时验证客户端"),
+        "message": ("string", "测试消息，默认 hello"),
+        "port": ("integer", "服务器监听端口，默认 12345"),
+        "host": ("string", "回环地址，默认 127.0.0.1")}),
     "load_skill": _schema({
         "name": ("string", "技能名，如 'pdf-report'"),
         "path": ("string", "可选：技能自带参考文件的相对路径")}),
@@ -431,21 +445,29 @@ def _run_python(ws, cfg, path, args="", _progress=None, _confirmed=False):
     except ValueError:
         return "错误: args 参数格式非法（无法分词）"
     # Popen + 轮询：长跑时持续上报进度（防 UI 看门狗误报超时）
+    # 使用 UTF-8 + communicate：避免 Windows GBK 输出解码失败，以及 stdout/stderr
+    # 管道写满时 poll()+read() 相互等待。短脚本不再固定等待 5 秒。
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            cwd=str(ws.root))
+                            encoding="utf-8", errors="replace",
+                            env=env, cwd=str(ws.root))
     t0 = time.monotonic()
-    while proc.poll() is None:
-        if time.monotonic() - t0 > 60:
-            proc.kill()
-            proc.wait()
-            return ("错误: 脚本执行超时(60s)（脚本可能存在死循环或长时间计算，"
-                    "请检查 while 循环的退出条件，或拆小计算量）")
-        if _progress:
-            _progress(f"脚本运行中… {int(time.monotonic() - t0)}s")
-        time.sleep(5)
-    out = proc.stdout.read() or ""
-    err = proc.stderr.read() or ""
+    last_progress = t0
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            if now - t0 > 60:
+                proc.kill()
+                proc.communicate()
+                return ("错误: 脚本执行超时(60s)（脚本可能存在死循环或长时间计算，"
+                        "请检查 while 循环的退出条件，或拆小计算量）")
+            if _progress and now - last_progress >= 1:
+                last_progress = now
+                _progress(f"脚本运行中… {int(now - t0)}s")
     code = proc.returncode
     parts = []
     if out:
@@ -657,3 +679,7 @@ def tools_description(cfg=None, ws=None, task: str = "") -> str:
     except Exception as e:
         log.warning("技能清单生成失败: %s", e)
     return "\n".join(lines)
+
+# 常驻进程 / TCP 联调工具在此注册，避免影响普通工具的导入路径。
+from core import process_tools as _process_tools  # noqa: E402,F401
+

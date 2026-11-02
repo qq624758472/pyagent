@@ -1166,7 +1166,9 @@ class MainWindow(QMainWindow):
 
         确认框的模态事件循环期间看门狗可能触发——_confirm_pending 已豁免；
         等待上限 3 分钟，超时按拒绝处理（不阻塞 worker 线程到天荒地老）。"""
-        box = {"ok": False, "ev": threading.Event()}
+        # 回调线程与主线程共享明确的过期标记，晚到的点击不得被误记为允许。
+        box = {"ok": False, "ev": threading.Event(),
+               "lock": threading.Lock(), "expired": False}
         self._confirm_pending = True
         try:
             self.confirm_signal.emit(box, str(name), str(reason))
@@ -1175,26 +1177,46 @@ class MainWindow(QMainWindow):
             self._confirm_pending = False
             return False
         got = box["ev"].wait(180)
+        with box["lock"]:
+            if not got:
+                box["expired"] = True
+            allowed = got and bool(box["ok"])
         self._confirm_pending = False
         self._feed_watchdog()
         if not got:
-            log.warning("高危确认等待超时(180s)，按拒绝处理: %s", name)
+            log.warning("高危确认等待超时(180s)，本次未执行: %s", name)
             return False
-        return bool(box["ok"])
+        return allowed
 
     @pyqtSlot(object, str, str)
     def _on_confirm_dialog(self, box, name, reason):
         """主线程槽：弹确认框，结果写回 box 并放行 worker 线程"""
         try:
-            ans = QMessageBox.question(
-                self, "高危操作确认",
+            with box["lock"]:
+                if box["expired"]:
+                    log.warning("丢弃已过期的高危确认弹窗: %s", name)
+                    return
+            dialog = QMessageBox(QMessageBox.Question, "高危操作确认",
                 f"Agent 请求执行高危操作：\n\n{name}\n\n{reason}\n\n是否允许执行？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            box["ok"] = (ans == QMessageBox.Yes)
+                QMessageBox.Yes | QMessageBox.No, self)
+            dialog.setDefaultButton(QMessageBox.No)
+            # 弹框与工作线程使用同一个截止时间；防止过期弹窗一直挂着。
+            timer = QTimer(dialog)
+            timer.setSingleShot(True)
+            timer.timeout.connect(dialog.reject)
+            timer.start(179000)
+            ans = dialog.exec_()
+            timer.stop()
+            with box["lock"]:
+                if box["expired"]:
+                    log.warning("忽略过期后才作出的高危确认结果: %s", name)
+                    return
+                box["ok"] = (ans == QMessageBox.Yes)
             log.info("高危操作确认: %s → %s", name,
-                     "允许" if box["ok"] else "拒绝")
+                     "允许" if box["ok"] else "拒绝或超时")
         except Exception as e:
-            box["ok"] = False
+            with box["lock"]:
+                box["ok"] = False
             log.warning("确认框异常，按拒绝处理: %s", e)
         finally:
             box["ev"].set()

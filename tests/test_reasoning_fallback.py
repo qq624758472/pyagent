@@ -114,12 +114,14 @@ check("重试后拿到内容", out4 == "重试后成功", repr(out4))
 check("重试有退避等待(>=1.4s)", time.monotonic() - t0 >= 1.4, f"{time.monotonic()-t0:.1f}s")
 srv4.shutdown()
 
-print("== 5. 端到端：Agent 经 reasoning-only 网关完成任务 ==")
+print("== 5. 端到端：文本协议保留 reasoning-only 网关兼容性 ==")
 srv5 = make_server(lambda h: send_sse(h, [
     {"reasoning_content": "思考中……用户只打了招呼，直接回答即可。"},
     {"reasoning_content": "ANSWER: 你好！有什么可以帮你的？"},
 ]))
-ag = Agent(client_for(srv5))
+llm5 = client_for(srv5)
+llm5.cfg.protocol = "text"  # 文本协议允许兜底；原生协议不泄露 reasoning
+ag = Agent(llm5)
 events = list(ag.run("你好"))
 kinds = [e["type"] for e in events]
 answers = [e for e in events if e["type"] == "answer"]

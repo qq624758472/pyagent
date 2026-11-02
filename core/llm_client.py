@@ -44,13 +44,19 @@ class LLMClient:
         self.reasoning_fallback_used = False   # 最近一次是否用思考过程兜底当回复
 
     def _payload(self, messages, model=None):
-        return {"model": model or self.model, "messages": messages,
-                "temperature": self.cfg.temperature, "stream": True}
+        name = model or self.model
+        payload = {"model": name, "messages": messages,
+                   "temperature": self.cfg.temperature, "stream": True}
+        # gpt-oss 单轮生成预算，避免推理长时间占据工具执行循环。
+        if "gpt-oss" in name.lower():
+            payload["max_tokens"] = getattr(self.cfg, "max_output_tokens", 3072)
+            payload["reasoning_effort"] = getattr(self.cfg, "reasoning_effort", "low")
+        return payload
 
     def _iter_sse(self, payload, m_desc, timeout=None):
         """底层 SSE 迭代：产出 ("content"|"reasoning", 文本) 与 ("tool_delta", 片段列表)
 
-        连接类错误在未产出内容时自动重试（V23）；HTTP 错误不重试。
+        连接中断或可恢复的 HTTP 5xx 在尚未产出正文/工具调用时重试；其他 HTTP 错误不重试。
         timeout: 覆盖默认 (10,180)——长链路里的子步骤（如 web_collect 筛选）
         用更短超时，避免单次请求把整条任务拖死。"""
         url = self.base_url.rstrip("/") + "/chat/completions"
@@ -102,6 +108,15 @@ class LLMClient:
                         detail = str(raw_detail).strip()[:240]
                     except Exception:
                         detail = ""
+                # 推理服务/FRP 网关偶发 500/502/503/504：未收到正文或工具调用时安全重试。
+                # 已流出工具调用片段时不可重试，否则可能拼接/重复工具命令。
+                if (code in (500, 502, 503, 504) and chunks == 0
+                        and attempt < self.RETRY_ON_CONN):
+                    wait = self.RETRY_BACKOFF * (attempt + 1)
+                    log.warning("LLM HTTP %s，%.1fs 后重试(%d/%d)",
+                                code, wait, attempt + 1, self.RETRY_ON_CONN)
+                    time.sleep(wait)
+                    continue
                 log.error("LLM 请求失败 %s HTTP %s", m_desc, code)
                 suffix = f"；服务端信息: {detail}" if detail else ""
                 raise LLMError(
@@ -177,6 +192,7 @@ class LLMClient:
                            "或通过界面「设置…」/控制台 /key 配置。")
         payload = self._payload(messages, model)
         if tools:
+            self.reasoning_fallback_used = False
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
         m_desc = (f"model={payload['model']} msgs={len(messages)}"
@@ -217,11 +233,9 @@ class LLMClient:
                 yield {"type": "tool_call", "id": slot["id"] or f"call_{idx}",
                        "name": slot["name"], "arguments": slot["arguments"]}
         if not content_parts and not calls and self.last_reasoning:
-            # 既无正文也无工具调用，只有思考 → 兜底当正文（与文本协议一致）
-            log.warning("原生协议：无正文无工具调用，将思考过程(%d字)作为回复输出",
+            # 原生协议不能把 analysis 当最终答案；由 Agent 空轮重试。
+            log.warning("原生协议：只有推理(%d字)无最终内容/工具调用，按空轮处理",
                         len(self.last_reasoning))
-            self.reasoning_fallback_used = True
-            yield {"type": "content", "text": self.last_reasoning}
         log.info("LLM 响应完成 %s content=%d字 tools=%d 用时 %.1fs",
                  m_desc, len(text), len(calls), time.monotonic() - t0)
 
