@@ -34,6 +34,8 @@ def render_event(ev):
         print(f"  [重试] {ev['content']}")
     elif t == "redirect":
         print(f"  [纠偏] {ev['content']}")
+    elif t == "checkpoint":
+        print(f"  [进度] {ev['content']}")
     elif t == "cancelled":
         print("\n[已停止]\n")
     # keepalive / debug / delta：控制台不渲染（delta 已由 answer 汇总）

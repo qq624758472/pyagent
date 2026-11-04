@@ -1,4 +1,5 @@
 """Agent 核心：ReAct 循环（思考 → 工具调用 → 观察 → … → 回答）"""
+import hashlib
 import json
 import re
 import time
@@ -27,7 +28,7 @@ def _parse_tool_args(raw) -> Optional[dict]:
 
 def _is_skill_tool(name: str) -> bool:
     """是否技能工具（skill_<slug> 或 load_skill）"""
-    n = str(name or "")
+    n = str(name or "").strip().casefold()
     return n.startswith("skill_") or n == "load_skill"
 
 SYSTEM_PROMPT = """你是一个可以操作"工作区"目录的智能助手（Agent）。
@@ -57,6 +58,7 @@ ANSWER: 工作区内共有 3 个文件：a.txt、b.py、notes.md。
   拿到输出继续推理——绝不把"请用户自己运行"当作回答
 - 不要编造工具结果或文件内容
 - 任务完成后必须以 ANSWER 结束
+- 编码任务必须反复执行“实际运行测试→读取错误→修改文件→重新测试”，最后一次修改后测试通过才可完成；通过当前步骤后继续完成其余要求
 - 使用中文交流"""
 
 # V25「仅提问」模式系统提示：纯对话，不引导也不执行工具
@@ -89,7 +91,7 @@ SYSTEM_PROMPT_NATIVE = (
     "若测试报错必须修改代码并重跑；未实际验证不得宣称测试通过。"
     "TCP 服务器调试用 start_process 或 tcp_echo_test，不要用同步 run_python 等待常驻服务退出。"
     "最终回答要完整给出结论，不要写“我需要先…”这类自述。"
-    "若任务匹配某个 skill_* 技能工具，先调用它获取操作规范再执行。")
+    "若任务匹配技能且规范尚未提供，先加载规范；已自动提供或加载的技能不要重复加载，继续实际工作。")
 
 
 class Agent:
@@ -111,6 +113,8 @@ class Agent:
         self.max_iterations = max_iterations
         self.qa_mode = qa_mode      # V25 仅提问模式：纯对话，不执行工具
         self.messages = []          # 对话历史，跨 run 保持（多轮上下文）
+        self._session_memory = {"requests": [], "results": []}
+        self._research = None
         self._force_text = False    # 端点拒绝 tools 参数后置位，永久回退文本协议
         self._reuse_task_on_fallback = False  # native→text 回退时复用已入历史的任务消息
         self._last_call_sig = None  # 上一轮工具调用签名（V31 重复调用熔断）
@@ -134,6 +138,27 @@ class Agent:
 
     def reset(self):
         self.messages.clear()
+        self._session_memory = {"requests": [], "results": []}
+        self._research = None
+
+    def restore_session(self, data):
+        from core.session_context import infer_memory, normalize_messages
+        self._research = None
+        self.messages = normalize_messages(data.get('messages'))
+        memory = data.get('continuity')
+        self._session_memory = (json.loads(json.dumps(memory)) if isinstance(memory, dict)
+                                else infer_memory(self.messages))
+
+    def session_memory(self):
+        """交接记录独立于上下文裁剪保存；旧验证只作线索，恢复后重新核验。"""
+        memory = json.loads(json.dumps(self._session_memory))
+        if getattr(self, '_research', None) is not None:
+            memory['research'] = self._research.snapshot()
+        for msg in reversed(self.messages):
+            if msg.get('role') == 'assistant' and msg.get('content') and not msg.get('tool_calls'):
+                memory['last_reply'] = msg['content'][-1200:]
+                break
+        return memory
 
     def run(self, task: str,
             should_stop: Optional[Callable[[], bool]] = None,
@@ -147,8 +172,46 @@ class Agent:
         由调用方提供线程安全的通道，如 GUI 的 Qt 信号）
         confirm: 可选高危操作确认回调 confirm(name, reason) -> bool，
         透传给 execute_tool（递归删除 / shell / 本地 Python 执行前弹确认）"""
+        from core.session_context import is_continue, resume_task
+        if not self._reuse_task_on_fallback:
+            self._resume_context = ''
+            if is_continue(task) and (self.messages or self._session_memory.get('requests')):
+                memory = self.session_memory()
+                self._resume_context = '\n\n' + resume_task(memory, self.workspace.root if self.workspace else '')
+                task = '\n'.join(memory.get('requests') or [task]) + '\n本次要求：接着尚未完成的步骤继续。'
+            elif not is_continue(task):
+                requests = self._session_memory.setdefault('requests', [])
+                requests.append(task[:2000])
+                if len(requests) > 8:
+                    del requests[1:-7]
         self._last_call_sig, self._repeat_count = None, 0   # 重复熔断按任务重置
         self._last_tool_name, self._tool_streak = None, 0
+        if not self._reuse_task_on_fallback:
+            self._revision = 0
+            self._verified = self._tested = -1
+            self._network_verified = False
+            self._failed_calls = {}
+            self._progress_seen = set()
+            self._idle_rounds = 0
+            self._stall_recoveries = 0
+            self._stream_recoveries = 0
+            self._loaded_skill_results = {}
+            self._loaded_skill_names = set()
+            self._last_failure = ""
+            self._checkpoint_step = None
+            self._document_outputs = {}
+            if self._resume_context and self.workspace:
+                for path in self._session_memory.get('files') or []:
+                    if str(path).lower().endswith('.docx'):
+                        try:
+                            document = self.workspace.resolve(path)
+                            self._document_outputs[str(document)] = document
+                        except WorkspaceError:
+                            pass
+            self._initial_word_files = self._word_snapshot() if re.search(r"Word|\.docx", task, re.I) else {}
+            from core.research_state import ResearchState
+            self._research = ResearchState(task, self._session_memory.get('research') if self._resume_context else None)
+        self._task = task
         # V28 协议分流：native = 原生 function calling（gpt-oss 等思考模型
         # 唯一可靠路径）；text = 原有 ACTION/ANSWER 文本协议
         if self._native_mode():
@@ -161,11 +224,10 @@ class Agent:
             # 避免重复追加任务导致小模型把同一请求理解成两个任务。
             self._reuse_task_on_fallback = False
         else:
-            self.messages.append({"role": "user", "content": task + skill_hint})
+            self.messages.append({"role": "user", "content": task + skill_hint + self._resume_context})
         self._trim_history()
         used_tools = False          # 本任务是否已成功执行过工具
         redirected = False         # 教程式纠偏只用一次（防循环）
-        fail_streak = 0            # 连续执行失败计数（闭环校验）
         empty_streak = 0           # 连续空回复计数（V23）
         protocol_nudge = 0         # 协议提醒次数（V26 思考含工具意图时追问）
         written = {}               # 本任务成功写入的文件 path 集合（V21 落盘追踪）
@@ -174,10 +236,16 @@ class Agent:
                  brief(task, 120), len(self.messages),
                  self.workspace.root if self.workspace else "未挂载")
 
-        for step in range(self.max_iterations):
+        step = -1
+        while True:
+            step += 1
             if should_stop and should_stop():
                 log.info("任务取消（外部停止）")
                 yield {"type": "cancelled"}
+                return
+
+            yield from self._loop_checkpoint(step)
+            if self._idle_rounds > self._idle_limit():
                 return
 
             full = ""
@@ -195,11 +263,16 @@ class Agent:
 
             # 桩/自定义 LLM 可能没有 on_activity 形参 → 兼容调用
             try:
-                stream = self.llm.chat_stream(self.messages, on_activity=_act)
+                stream = self.llm.chat_stream(self._request_messages(), on_activity=_act)
             except TypeError:
-                stream = self.llm.chat_stream(self.messages)
+                stream = self.llm.chat_stream(self._request_messages())
             try:
                 for delta in stream:
+                    if not delta:
+                        yield {"type": "keepalive", "phase": "waiting"}
+                        if should_stop and should_stop():
+                            break
+                        continue
                     full += delta
                     chunk_n += 1
                     yield {"type": "delta", "content": delta}
@@ -211,6 +284,13 @@ class Agent:
                     if should_stop and should_stop():
                         break
             except LLMError as e:
+                if should_stop and should_stop():
+                    yield {"type": "cancelled"}
+                    return
+                if self._recover_interrupted_stream(e):
+                    yield {"type": "redirect", "discard_partial": True,
+                           "content": f"响应中途断开，已丢弃未完成片段，保留已执行结果，自动续做 {self._stream_recoveries}/2"}
+                    continue
                 log.error("任务终止(LLM错误): %s", brief(e, 200))
                 yield {"type": "error", "content": str(e)}
                 return
@@ -300,6 +380,13 @@ class Agent:
                                   "已要求它按协议重新输出"}
                 continue
 
+            if parsed is None or parsed.get("type") == "answer":
+                issue = self._completion_issue(task)
+                if issue:
+                    self._last_failure = issue
+                    self.messages.append({"role": "user", "content": issue})
+                    yield {"type": "redirect", "content": issue}
+                    continue
             if parsed is None:                      # 宽容策略：无 ACTION 视为直接回答
                 if (not used_tools and not redirected
                         and len(full) > self.TUTORIAL_MIN_CHARS
@@ -351,12 +438,11 @@ class Agent:
                 approved=approved,
                 repeat=self._track_repeat(name, arguments)[0],
                 streak=self._tool_streak)
+            self.messages.append({"role": "user", "content": result})
+            self._trim_history()
             yield {"type": "observation", "content": result}
             used_tools = True        # 本任务已实际执行过工具
 
-        log.error("达到最大迭代次数(%d)，任务终止", self.max_iterations)
-        yield {"type": "error",
-               "content": f"已达到最大迭代次数({self.max_iterations})，任务终止。"}
 
     # ---------- V28 原生 function calling 协议 ----------
     def _native_mode(self) -> bool:
@@ -411,7 +497,7 @@ class Agent:
                 "若失败，阅读错误、修改代码后重试；测试通过才能宣称完成。"
                 "若需手动逐步调试，使用 start_process/process_status/stop_process 管理服务。")
         self.messages.append({"role": "user",
-                              "content": f"{ws_hint}\n\n用户任务：{task}{skill_hint}{coding_hint}"})
+                              "content": f"{ws_hint}\n\n用户任务：{task}{skill_hint}{coding_hint}{self._resume_context}"})
         self._trim_history()
         # Python 小项目只暴露编码所需的少量工具，降低小模型在 13+ 工具间
         # 选择的负担与 Ollama 上下文占用；其他项目仍保留完整工具集。
@@ -425,6 +511,11 @@ class Agent:
                            "create_dir", "search_files", "run_python"]
                           if python_project else None))
         tools = openai_tools(include=tools_include, cfg=cfg, ws=self.workspace, task=task)
+        if self._research.document and not self._needs_code_work(task):
+            document_tools = {'list_files', 'read_file', 'search_files', 'write_file',
+                              'append_file', 'create_dir', 'load_skill'}
+            tools = [t for t in tools if t['function']['name'] in document_tools
+                     or _is_skill_tool(t['function']['name'])]
         empty_streak = 0
         loaded_skills = []           # 本任务已加载的技能（V30）
         written = {}                 # 本任务写入的文件（落盘追踪，原生路径同样适用）
@@ -432,19 +523,6 @@ class Agent:
         # 编码任务以实际测试为完成条件，不能把 write_file 成功当作项目完成。
         coding_task = bool(ws and re.search(r"测试|运行|执行|验证|test|项目|project", task, re.I)
                            and re.search(r"代码|脚本|程序|创建|编写|实现|修改|开发|app\.py|\.py", task, re.I))
-        # TCP 联调以 tcp_echo_test 的真实发送/接收为验收标准；不能因工具名含
-        # test 或任务要求「测试结果」，误要求另外生成 unittest 脚本。
-        explicit_unit_tests = bool(re.search(
-            r"单元测试|unittest|pytest|测试脚本|测试文件|test[_-][\w-]*\.py", task, re.I))
-        tests_required = bool(coding_task and
-            (explicit_unit_tests or (not network_debug_task and
-             re.search(r"测试|test", task, re.I))))
-        code_revision, verified_revision, tested_revision = 0, -1, -1
-        network_verified = False
-        completion_nudges = 0
-        doc_nudges = 0
-        # 同一版本的脚本运行失败后必须先修改代码，再允许重试。
-        failed_exec_revision = {}
         # 在模型端点连续 5xx 时允许有限次数的上下文恢复，不丢失工作区产物。
         model_recoveries = 0
         reasoning_recoveries = 0
@@ -457,15 +535,24 @@ class Agent:
         # gpt-oss-20B 实测偶发"全空回合"（无正文/思考/工具调用），此前每次
         # 重试烧掉 1/8 迭代，8 上限经不起浪费；由 MAX_EMPTY_RETRIES 封顶防死循环。
         step = 0
-        while step < self.max_iterations:
+        while True:
             if should_stop and should_stop():
                 log.info("任务取消（外部停止）")
                 yield {"type": "cancelled"}
                 return
+            yield from self._loop_checkpoint(step)
+            if self._idle_rounds > self._idle_limit():
+                return
             content_parts, tool_calls = [], []
             yield {"type": "keepalive"}        # 喂看门狗：覆盖「组消息 → 首 token」静默窗口
             try:
-                for ev in self.llm.chat_turn(self.messages, tools=tools):
+                phase_tools = tools
+                if self._research.drafting:
+                    phase_tools = [t for t in tools if t['function']['name'] not in self._research.TOOLS]
+                for ev in self.llm.chat_turn(self._request_messages(), tools=phase_tools):
+                    if should_stop and should_stop():
+                        yield {"type": "cancelled"}
+                        return
                     if ev["type"] == "content":
                         content_parts.append(ev["text"])
                         yield {"type": "delta", "content": ev["text"]}
@@ -473,8 +560,17 @@ class Agent:
                         tool_calls.append(ev)
                     elif ev["type"] == "keepalive":
                         # V31.2：思考期心跳，透传给 UI 喂看门狗（防误报超时）
-                        yield {"type": "keepalive"}
+                        yield {"type": "keepalive", "phase": ev.get("phase")}
+                    elif ev['type'] == 'progress':
+                        yield {'type': 'progress', 'content': ev.get('content', '')}
             except LLMError as e:
+                if should_stop and should_stop():
+                    yield {"type": "cancelled"}
+                    return
+                if self._recover_interrupted_stream(e):
+                    yield {"type": "redirect", "discard_partial": True,
+                           "content": f"响应中途断开，已丢弃未完成片段，保留已执行结果，自动续做 {self._stream_recoveries}/2"}
+                    continue
                 # 端点不认 tools 参数 → 自动回退文本协议
                 if ("HTTP 400" in str(e)
                         and not getattr(self, "_force_text", False)):
@@ -483,8 +579,7 @@ class Agent:
                     log.warning("端点拒绝 tools 参数（HTTP 400），自动回退文本协议")
                     yield {"type": "redirect",
                            "content": "该端点不支持原生工具调用，已自动切换到文本协议"}
-                    # _run_native 已经把当前任务追加到历史。移除这一条，
-                    # 让文本协议入口重新追加一次；保留此前完整对话上下文。
+                    # 回退复用当前任务及验证状态，保留此前完整对话上下文。
                     yield from self.run(task, should_stop, progress, confirm)
                     return
                 recoverable = any(f"HTTP {code}" in str(e) for code in (500, 502, 503, 504))
@@ -510,6 +605,8 @@ class Agent:
                 return
 
             text = "".join(content_parts)
+            if text.strip() or tool_calls:
+                empty_streak = 0
             if tool_calls:
                 tool_msgs, results = [], []
                 # 大块 write_file 参数只在实际请求中需要一次；下一轮历史只保留
@@ -538,52 +635,23 @@ class Agent:
                         yield {"type": "format_error", "content": result}
                     else:
                         yield {"type": "action", "name": tc["name"], "arguments": args}
-                        call_key = (tc["name"], json.dumps(args, ensure_ascii=False,
-                                                            sort_keys=True))
                         repeat = self._track_repeat(tc["name"], args)[0]
-                        if (tc["name"] in ("run_python", "run_command") and
-                                failed_exec_revision.get(call_key) == code_revision):
-                            result = ("错误: 相同代码版本上次运行已失败，本次禁止无修改重复运行。"
-                                      "先 read_file 查看错误文件，使用 write_file 修复代码后，"
-                                      "才能重新调用 run_python；原样重跑不能解决问题。")
-                        else:
-                            result = self._execute_and_observe(
-                                tc["name"], args, step, task, written,
-                                should_stop=should_stop, progress=progress,
-                                confirm=confirm, approved=approved,
-                                repeat=repeat, streak=self._tool_streak)
-                        if (tc["name"] in ("run_python", "run_command") and
-                                self._execution_failed(tc["name"], result)):
-                            failed_exec_revision[call_key] = code_revision
-                            last_execution_failure = "\n".join(result.splitlines()[-14:])[-1200:]
-                        elif tc["name"] in ("run_python", "run_command"):
-                            failed_exec_revision.pop(call_key, None)
+                        result = self._execute_and_observe(
+                            tc["name"], args, step, task, written,
+                            should_stop=should_stop, progress=progress,
+                            confirm=confirm, approved=approved,
+                            repeat=repeat, streak=self._tool_streak)
+                        if self._execution_failed(tc["name"], result):
+                            last_execution_failure = result[-1200:]
                     yield {"type": "observation", "content": result}
                     tool_msgs.append({"role": "tool", "tool_call_id": tc["id"],
                                       "name": tc["name"], "content": result})
                     results.append(result)
-                    if args is not None:
-                        ok = not self._execution_failed(tc["name"], result)
-                        file_path = str(args.get("path", "")).replace("\\\\", "/").lower()
-                        if ok and tc["name"] in ("write_file", "append_file") and file_path.endswith(".py"):
-                            code_revision += 1
-                            if network_debug_task:
-                                network_verified = False
-                        if ok and tc["name"] in ("run_python", "run_command"):
-                            verified_revision = code_revision
-                            if (tc["name"] == "run_python" and
-                                    re.search(r"(^|/)test[^/]*\.py$", file_path) and
-                                    re.search(r"Ran\s+[1-9]\d*\s+tests?", result) and
-                                    re.search(r"(?m)^OK\s*$", result)):
-                                tested_revision = code_revision
-                        if (ok and tc["name"] == "tcp_echo_test"
-                                and "TCP联调通过" in result):
-                            network_verified = True
-                            verified_revision = code_revision
                     # V30 技能加载：规范是「接下来怎么做」的指令，不是任务结果——
                     # 不能参与目标核对闭环，否则模型会以为加载完就算完成
-                    if _is_skill_tool(tc["name"]):
-                        loaded_skills.append(tc["name"])
+                    if (_is_skill_tool(tc["name"]) and not self._execution_failed(tc["name"], result)
+                            and self._loaded_skill_names):
+                        loaded_skills = sorted(self._loaded_skill_names)
                 # 目标核对闭环（对应文本协议 V17）：工具全成功时提醒模型自检——
                 # 实测缺这一步会出现"工具全成功却回答『无法完成』"（模型自评失败）
                 if (tool_msgs and not loaded_skills
@@ -592,104 +660,35 @@ class Agent:
                         "\n\n（本工具操作成功，但不等于整个任务完成。若用户要求运行/测试，"
                         "请先执行测试并确认退出码为零，修复失败再重跑；全部步骤完成后才给最终答案。）")
                 # 已加载技能：显式要求按规范执行（不依赖模型自发理解）
-                if loaded_skills:
+                if loaded_skills and not any(self._execution_failed('', str(r)) for r in results):
                     tool_msgs[-1]["content"] += (
                         "\n\n（已加载技能规范：" + "、".join(loaded_skills)
                         + "。请严格按照上面技能规范中的步骤执行本任务，"
                           "规范要求调用的工具要照常调用；完成后再给出最终答案。）")
-                # 小项目交付检查点：实际单元测试成功且文档齐全后直接收尾。
-                # 避免小模型在已完成任务后继续重写通过的代码，引入回归。
-                if (python_project and tests_required and code_revision > 0
-                        and tested_revision == code_revision and ws is not None):
-                    try:
-                        readme = ws.resolve("README.md", must_exist=True)
-                        docs = readme.read_text(encoding="utf-8")
-                        docs_ready = (len(docs.strip()) >= 120 and
-                                      all(cmd in docs for cmd in ("add", "list", "done")))
-                    except (OSError, ValueError, WorkspaceError):
-                        docs_ready = False
-                    if docs_ready:
-                        self.messages.extend(tool_msgs)
-                        self._trim_history()
-                        final_text = ("已完成 Python 项目文件与 README.md；"
-                                      "最后一次代码修改后，run_python 执行的 unittest "
-                                      "测试报告通过。请以工作区文件和实际测试输出为准。")
-                        self._append_assistant_history(final_text)
-                        log.info("项目验证检查点已通过，阻止后续无意义重写")
-                        yield {"type": "answer", "content": final_text}
-                        return
                 self.messages.extend(tool_msgs)
                 self._trim_history()
-                step += 1               # 只有真实执行过工具才消耗迭代配额
+                step += 1
                 continue
 
             if text.strip():
                 text = self._clean_answer(text)
-                if network_debug_task and not network_verified:
+                if network_debug_task and not self._network_verified:
                     missing = "尚未使用 tcp_echo_test 完成真实 TCP 发送、回显及客户端验证"
-                    if completion_nudges < 3 and step < self.max_iterations - 1:
-                        completion_nudges += 1
-                        self._append_assistant_history(text)
-                        self.messages.append({"role": "user", "content":
-                            f"执行任务未通过：{missing}。不能仅输出手工运行说明。"
-                            "请直接调用 tcp_echo_test；若失败就修复对应代码并重新测试。"})
-                        yield {"type": "redirect", "content": missing}
-                        step += 1
-                        continue
-                    yield {"type": "error", "content": missing + "，不能宣称任务已完成。"}
-                    return
-                if coding_task and code_revision and (verified_revision < code_revision or
-                        (tests_required and tested_revision < code_revision)):
-                    missing = ("执行 test*.py 并确认 unittest 测试通过"
-                               if tests_required and tested_revision < code_revision
-                               else "用 run_python 实际运行新修改的程序并确认结果")
-                    if completion_nudges < 2 and step < self.max_iterations - 1:
-                        completion_nudges += 1
-                        self._append_assistant_history(text)
-                        self.messages.append({"role": "user", "content":
-                            f"验收未通过：最后一次代码修改后尚未{missing}。"
-                            "你不能宣称项目完成。立即调用真实工具进行验证；失败就修改后重试。"})
-                        log.warning("阻止未验证的代码任务提前回答：%s", missing)
-                        yield {"type": "redirect", "content": f"尚未{missing}，继续验证"}
-                        step += 1
-                        continue
-                    yield {"type": "error", "content": f"代码已写入，但尚未{missing}；"
-                           "不能报告项目完成。请检查测试输出和迭代上限。"}
-                    return
-                # 编码任务文档完整性：明确要求 README.md 时，不允许交付空文档、
-                # 占位文档或缺少用户指定的命令示例。
-                if coding_task and ws is not None and re.search(r"README\.md", task, re.I):
-                    readme_path = ws.root / "README.md"
-                    try:
-                        readme = readme_path.read_text(encoding="utf-8")
-                    except (OSError, UnicodeError):
-                        readme = ""
-                    expected_commands = set(re.findall(
-                        r"python\s+\S+\.py\s+([a-z][\w-]*)", task, re.I))
-                    missing_commands = [cmd for cmd in sorted(expected_commands)
-                                        if not re.search(r"\b" + re.escape(cmd) + r"\b",
-                                                         readme, re.I)]
-                    doc_issue = (not readme_path.is_file() or len(readme.strip()) < 180
-                                 or bool(missing_commands) or "此处" in readme
-                                 or "待补充" in readme)
-                    if doc_issue:
-                        reason = ("README.md 不存在或过于简略，必须写清使用步骤。"
-                                  + (f"缺少这些命令：{', '.join(missing_commands)}。" if missing_commands else ""))
-                        if doc_nudges < 3 and step < self.max_iterations - 1:
-                            doc_nudges += 1
-                            self._append_assistant_history(text)
-                            self.messages.append({"role": "user",
-                                "content": (f"交付验收未通过：{reason}"
-                                            "现在使用 write_file 补全 README.md，"
-                                            "包括项目说明、安装/运行方法和用户要求的所有 CLI 示例。"
-                                            "只修改文档即可；如果也修改 Python 代码，则必须重跑测试。")})
-                            log.warning("阻止缺失/不完整文档交付: %s", reason)
-                            yield {"type": "redirect", "content": reason}
-                            step += 1
-                            continue
-                        yield {"type": "error",
-                               "content": f"项目单元测试已完成，但{reason}无法宣称全部交付完成。"}
-                        return
+                    self._append_assistant_history(text)
+                    self.messages.append({"role": "user", "content":
+                        f"执行任务未通过：{missing}。不能仅输出手工运行说明。"
+                        "请直接调用 tcp_echo_test；若失败就修复对应代码并重新测试。"})
+                    yield {"type": "redirect", "content": missing}
+                    step += 1
+                    continue
+                issue = self._completion_issue(task)
+                if issue:
+                    self._last_failure = issue
+                    self._append_assistant_history(text)
+                    self.messages.append({"role": "user", "content": issue})
+                    yield {"type": "redirect", "content": issue}
+                    step += 1
+                    continue
                 self._append_assistant_history(text)
                 log.info("ANSWER: %s", brief(text, 600))
                 yield {"type": "answer", "content": text}
@@ -725,11 +724,225 @@ class Agent:
             self.messages.append({"role": "user",
                                   "content": "（上一轮输出为空。请调用工具继续任务，"
                                              "或直接给出最终中文回答。）"})
-        log.error("达到最大迭代次数(%d)，任务终止", self.max_iterations)
-        yield {"type": "error",
-               "content": f"已达到最大迭代次数({self.max_iterations})，任务终止。"}
 
     # ---------- 工具执行 + 闭环校验（文本/原生协议共用） ----------
+    def _idle_limit(self):
+        # 旧 max_iterations 作为检查间隔和连续无进展预算，不再限制总轮数。
+        return max(16, int(self.max_iterations))
+
+    def _loop_checkpoint(self, step):
+        self._idle_rounds += 1
+        if self._idle_rounds > self._idle_limit():
+            if self._stall_recoveries < 1:
+                self._stall_recoveries += 1
+                self._idle_rounds = 0
+                try:
+                    listing = self.workspace.list_files('.', recursive=True)[:1800] if self.workspace else '未挂载工作区'
+                except (OSError, WorkspaceError):
+                    listing = '请重新检查工作区文件'
+                rules = '\n\n'.join(self._loaded_skill_results.values())[:4000]
+                summary = (f"自动恢复：此前连续 {self._idle_limit()} 轮没有新进展，必须改变策略。"
+                           f"原任务：{self._task}\n实际工作区文件：\n{listing}\n"
+                           f"最近错误：{self._last_failure or '重复操作，没有产生新的结果'}\n"
+                           f"本任务已加载的技能规范（不要再次加载）：\n{rules or '无'}\n"
+                           "禁止继续循环列目录、读取同一区间或加载同一技能。"
+                           "若需要分析代码，读取尚未检查的相关文件；已有足够信息就生成实际产物。"
+                           "Word 文档用 write_file 写入完整正文，然后 read_file 核对。"
+                           "保留已经生成的文件，继续未完成部分；没有真实完成就不能声称成功。")
+                self.messages = [self.messages[0], {"role": "user", "content": summary}]
+                yield {"type": "redirect", "content": "检测到重复操作，已整理任务状态并保留文件，正在换策略继续。"}
+                return
+            yield {"type": "error", "content": (
+                f"自动恢复后连续 {self._idle_limit()} 轮仍没有新的有效结果，暂停当前任务；文件已保留。"
+                f"最近失败：{self._last_failure or '重复操作或未执行必要验证'}")}
+        elif (step and step % max(1, int(self.max_iterations)) == 0
+              and step != self._checkpoint_step):
+            self._checkpoint_step = step
+            status = (f"已运行 {step} 轮，继续当前任务。代码版本 {self._revision}，"
+                      f"已验证版本 {self._verified}，测试通过版本 {self._tested}。"
+                      f"最近错误：{self._last_failure or '无'}。"
+                      f"当前任务：{brief(self._task, 1800)}。"
+                      "依据真实工具输出修复后重测；当前步骤通过后继续其余要求，不要重建已完成文件。")
+            phase = ''
+            if self._research.document:
+                phase = ('验证文档' if self._document_outputs else
+                         ('生成文档' if self._research.drafting or self._research.produced else '收集资料'))
+                status = (f'已运行 {step} 轮，当前阶段：{phase}。已跟踪 Word 文件 {len(self._document_outputs)} 个。'
+                          f'最近错误：{self._last_failure or "无"}。'
+                          '已有资料先形成实际草稿，再补充缺失证据；生成目标 Word 后检查结构与正文。')
+            self.messages.append({"role": "user", "content": status})
+            self._trim_history()
+            log.info("任务检查点: %s", status)
+            yield {"type": "checkpoint", "round": step,
+                   "content": f"已处理 {step} 轮，{phase or '正在继续当前任务'}。", "details": status}
+
+    def _word_snapshot(self):
+        files = {}
+        if self.workspace:
+            for path in self.workspace.root.rglob("*.docx"):
+                try:
+                    resolved = self.workspace.resolve(str(path))
+                    stat = resolved.stat()
+                    files[str(resolved)] = (stat.st_mtime_ns, stat.st_size)
+                except (OSError, WorkspaceError):
+                    continue
+        return files
+
+    def _completion_issue(self, task):
+        from core.word_documents import DocumentError, inspect_docx
+        documents = getattr(self, "_document_outputs", {})
+        wants_word = bool(re.search(
+            r"(?:生成|创建|编写|撰写|写|输出|导出|保存).*(?:Word|\.docx)|(?:Word|\.docx).*(?:生成|创建|编写|导出|保存)", task, re.I))
+        if wants_word and self.workspace:
+            from pathlib import Path
+            for path, stamp in self._word_snapshot().items():
+                if getattr(self, "_initial_word_files", {}).get(path) != stamp:
+                    documents[path] = Path(path)
+        if wants_word and not documents:
+            return "交付验收未通过：尚未生成 Word 文件。请调用 write_file，path 使用 .docx，content 填完整正文；工具会生成真正的 Word 文档。"
+        for path in documents.values():
+            try:
+                info = inspect_docx(path)
+            except DocumentError as exc:
+                return f"交付验收未通过：Word 文件 {path.name} 无法打开：{exc}。使用 write_file 重新生成，不能只改后缀。"
+            if (re.search(r"报告|方案", task) and info["characters"] < 120
+                    and not re.search(r"一句|一行|简短|极简|示例|样例", task)):
+                return f"交付验收未通过：{path.name} 正文仅 {info['characters']} 字符，疑似只有标题或未写完。请结合已读取的资料补全用户要求的正文，不能宣称文档完成。"
+        # 分析现有源码并写文档，不等于要求修改/运行源码。
+        # 旧会话可能把“agent测试目录”等路径拼进任务，不能据此要求代码测试。
+        if wants_word and not self._needs_code_work(task):
+            return ''
+        coding = bool(self.workspace and re.search(
+            r"代码|脚本|程序|Python|项目|project|\.(?:py|js|ts|go|rs|java|c|cpp)\b", task, re.I)
+            and re.search(r"测试|运行|执行|验证|test|项目|project|修复", task, re.I))
+        if not coding:
+            return ""
+        tests = bool(re.search(r"单元测试|unittest|pytest|测试脚本|测试文件|test[_-][\w-]*\.py", task, re.I)
+                     or (re.search(r"测试|test", task, re.I)
+                         and not re.search(r"TCP|socket|服务端|服务器|客户端", task, re.I)))
+        if self._verified < self._revision or (tests and self._tested < self._revision):
+            return ("验收未通过：必须在最后一次修改后实际运行" +
+                    ("测试并确认至少一个测试通过" if tests else "程序并检查结果") +
+                    f"。最近执行错误：{self._last_failure[:600] if self._last_failure and not self._last_failure.startswith(('验收未通过', '交付验收未通过')) else '尚未验证或需要重测'}。"
+                    "立即调用工具；失败就读取错误、修复文件、重新测试，不能宣称完成。")
+        if re.search(r"README\.md", task, re.I):
+            try:
+                readme = (self.workspace.root / "README.md").read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                readme = ""
+            commands = set(re.findall(r"python\s+\S+\.py\s+([a-z][\w-]*)", task, re.I))
+            missing = [cmd for cmd in sorted(commands)
+                       if not re.search(r"\b" + re.escape(cmd) + r"\b", readme, re.I)]
+            if len(readme.strip()) < 180 or missing or "此处" in readme or "待补充" in readme:
+                return ("交付验收未通过：README.md 不完整。使用 write_file 补全文档、运行步骤及示例。"
+                        + (f"缺少命令：{', '.join(missing)}。" if missing else "")
+                        + "若只修改文档无需重测；修改代码后必须再次验证。")
+        return ""
+
+    def _file_digest(self, arguments):
+        if self.workspace and arguments.get("path"):
+            try:
+                return hashlib.sha256(self.workspace.resolve(arguments["path"]).read_bytes()).hexdigest()
+            except (OSError, ValueError, WorkspaceError):
+                pass
+        return None
+
+    def _recover_interrupted_stream(self, error):
+        from core.llm_client import LLMStreamInterrupted
+        if not isinstance(error, LLMStreamInterrupted) or self._stream_recoveries >= 2:
+            return False
+        self._stream_recoveries += 1
+        # 该轮尚未进入工具执行阶段，不保存正文/参数碎片，更不能重放它们。
+        # 仅从已有完整执行记录发起新的一轮，保留真实的版本和验收状态。
+        self._session_memory['last_failure'] = '模型响应中途断开；该轮工具未执行，需继续未完成步骤。'
+        self.messages.append({'role': 'user', 'content': (
+            f'网络响应中断，自动恢复 {self._stream_recoveries}/2。刚才这一轮响应已丢弃，工具没有执行。'
+            f'当前任务：{self._task}\n'
+            '保留此前已经完成的文件和执行结果，直接继续尚未完成的步骤。'
+            '如果已有足够资料，现在开始产出，不要重复遍历同一批文件或再次只说“准备生成”。'
+            '缩短每次输出，长内容分步生成并保存；不要拼接或执行上一轮未完成的参数。')})
+        self._trim_history()
+        log.warning('模型响应中断后安全续做 %d/2，保留已执行结果', self._stream_recoveries)
+        return True
+
+    def _record_result(self, name, arguments, result, before):
+        self._research_fresh = None
+        # 不记录大段源码参数，保留操作对象和真实执行结果的首尾供恢复定位。
+        target = arguments.get('path') or arguments.get('command') or arguments.get('code') or ''
+        record = f"{name} {str(target)[:240]}\n{result[:180]}"
+        if len(result) > 180:
+            record += '\n' + result[-500:]
+        records = self._session_memory.setdefault('results', [])
+        if not records or records[-1] != record:
+            records.append(record)
+            del records[:-6]
+        if self._execution_failed(name, result):
+            self._session_memory['last_failure'] = record
+        elif name in ('run_python', 'run_command', 'tcp_echo_test'):
+            self._session_memory['last_failure'] = ''
+        if name in ('run_python', 'run_command', 'tcp_echo_test'):
+            self._session_memory['last_execution'] = record
+        if name in ('write_file', 'append_file') and not self._execution_failed(name, result):
+            files = self._session_memory.setdefault('files', [])
+            path = str(arguments.get('path') or '')
+            if path and path not in files:
+                files.append(path)
+                del files[:-30]
+        if (self.workspace and name in ("write_file", "append_file")
+                and str(arguments.get("path", "")).lower().endswith(".docx")):
+            try:
+                path = self.workspace.resolve(arguments["path"])
+                self._document_outputs[str(path)] = path
+            except WorkspaceError:
+                pass
+        failed = self._execution_failed(name, result)
+        execution = name in ("run_python", "run_command", "tcp_echo_test")
+        key = (name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+        if failed:
+            self._last_failure = result[-1000:]
+            if execution:
+                self._failed_calls[key] = self._revision
+                self._verified = self._tested = -1
+                self._network_verified = False
+            return
+        self._failed_calls.pop(key, None)
+        digest = self._file_digest(arguments) if name in ("write_file", "append_file", "delete_file") else None
+        changed = name in ("write_file", "append_file", "delete_file") and before != digest
+        path = str(arguments.get("path", "")).replace("\\", "/").lower()
+        if changed and not path.endswith((".md", ".rst", ".docx")):
+            self._revision += 1
+            self._network_verified = False
+        if execution:
+            self._last_failure = ""
+            self._verified = self._revision
+            # 退出码为零、非零测试数量和框架成功报告同时满足；打印 demo 不算测试。
+            if ((re.search(r"Ran\s+[1-9]\d*\s+tests?", result)
+                 and re.search(r"(?m)^OK\s*$", result))
+                    or re.search(r"\b[1-9]\d* passed\b", result)):
+                self._tested = self._revision
+            if name == "tcp_echo_test" and "TCP联调通过" in result:
+                self._network_verified = True
+        research = getattr(self, '_research', None)
+        if research is not None:
+            if (changed and name in ('write_file', 'append_file')
+                    and path.endswith(('.md', '.txt', '.rst', '.docx'))
+                    and len(str(arguments.get('content') or '')) >= 120):
+                research.authored()
+            if name in research.TOOLS:
+                if not self._result_unproductive(result):
+                    visible = self._visible_observation(result)
+                    self._research_fresh = research.observe(name, arguments, visible, self.workspace)
+                    if self._research_fresh:
+                        self._idle_rounds = 0
+                return
+        # 按实际产物/结果去重；重复写同一内容、A/B 来回改动均不刷新预算。
+        evidence = ((name, path, digest) if name in ("write_file", "append_file", "delete_file")
+                    else (name, key[1], "executed" if execution else hashlib.sha256(result.encode()).hexdigest()))
+        if (changed or (name not in ("write_file", "append_file", "delete_file")
+                        and not self._result_unproductive(result))) and evidence not in self._progress_seen:
+            self._progress_seen.add(evidence)
+            self._idle_rounds = 0
+
     def _track_repeat(self, name: str, arguments: dict):
         """记录本任务的工具调用签名，返回 (同签名连续次数, 同工具连续次数)
 
@@ -764,15 +977,48 @@ class Agent:
         repeat: 该「工具+参数」签名连续重复的次数；streak: 同一工具连续调用
         的次数（无论参数）。超过阈值时在观察结果里注入换思路警告（V31）。"""
         t0 = time.monotonic()
+        if (self._research.drafting and name in self._research.TOOLS
+                and not (name == 'read_file' and str(arguments.get('path') or '').lower().endswith('.docx'))):
+            return ('OBSERVATION: 已进入生成文档阶段，本次未重复读取资料。'
+                    '先 write_file 保存有依据的 Markdown 草稿或目标 Word，再补充核对。\n'
+                    + self._research.context())
+        skill = None
+        if _is_skill_tool(name):
+            from core.skills import discover, find, resolve_tool
+            skill = (find(discover(self._config(), self.workspace), arguments.get('name', ''))
+                     if name == 'load_skill' else resolve_tool(name, self._config(), self.workspace))
+        skill_key = self._skill_cache_key(skill) if skill and not arguments.get('path') else None
+        if skill_key is not None and skill_key in getattr(self, '_loaded_skill_results', {}):
+            self._loaded_skill_names.add(skill.name)
+            if self._last_failure.startswith('错误: 未找到') and '技能' in self._last_failure:
+                self._last_failure = ''
+            return (f"SKILL：技能「{skill.name}」的规范已在本任务提供，无需重复加载。"
+                    "加载技能不是完成任务。现在调用本地工具完成实际工作："
+                    "分析代码用 read_file/search_files；写报告用 write_file 生成完整正文，再 read_file 核对。")
+        before = self._file_digest(arguments) if name in ("write_file", "append_file", "delete_file") else None
+        key = (name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+        if (name in ("run_python", "run_command", "tcp_echo_test")
+                and getattr(self, "_failed_calls", {}).get(key) == getattr(self, "_revision", 0)):
+            return ("错误: 相同代码版本上次运行已失败，本次禁止无修改重复运行。"
+                    "请读取错误并实际修改相关代码或配置后再验证。")
         result = execute_tool(name, self.workspace, self._config(),
                               arguments, progress=progress, confirm=confirm,
                               should_stop=should_stop, approved=approved)
+        if skill is not None and not self._execution_failed(name, result) and hasattr(self, '_loaded_skill_names'):
+            self._loaded_skill_names.add(skill.name)
+        if skill_key is not None and not self._execution_failed(name, result):
+            if hasattr(self, '_loaded_skill_results'):
+                self._loaded_skill_results[skill_key] = result
+                if self._last_failure.startswith('错误: 未找到') and '技能' in self._last_failure:
+                    self._last_failure = ''
+        if hasattr(self, "_revision"):
+            self._record_result(name, arguments, result, before)
         log.info("OBSERVATION(%d字, 耗时%.1fs): %s",
                  len(result), time.monotonic() - t0, brief(result, 400))
-        if len(result) > MAX_OBS_LENGTH:
-            half = MAX_OBS_LENGTH // 2
-            result = (result[:half] + "\n...(中间内容过长已截断，保留末尾错误原因)...\n"
-                      + result[-half:])
+        result = self._visible_observation(result)
+        if getattr(self, '_research_fresh', None) is False:
+            result = ('该资料的可见内容此前已收集，换行号范围不代表新进展。'
+                      '请使用已保存的资料记录，读取未覆盖内容或保存分析草稿。')
         # ---------- 执行结果闭环校验（V17） ----------
         failed = self._execution_failed(name, result)
         if not failed and name == "write_file" and "path" in arguments:
@@ -829,7 +1075,7 @@ class Agent:
                             "若已收集到足够信息，请直接 ANSWER 总结；"
                             "不要重复调用相同工具。）")
         # ---------- 重复调用熔断（V31） ----------
-        if repeat >= self.REPEAT_NUDGE:
+        if repeat >= self.REPEAT_NUDGE and not (name in ("run_python", "run_command", "tcp_echo_test") and not failed):
             obs += (f"\n\n⚠️ 重复调用警告：这是与上一轮完全相同的调用（已连续第 "
                     f"{repeat} 次），同样的调用只会得到同样的结果。请立即改变策略："
                     "检查参数是否用对、换用其他工具，或直接 ANSWER 总结已知信息——"
@@ -843,9 +1089,47 @@ class Agent:
             obs += (f"\n\n⚠️ 方向警告：你已连续 {streak} 次调用同一工具「{name}」"
                     f"（即使每次参数不同），且结果都没有产出。{hint}")
             log.warning("同工具刷屏熔断: %s 连续第 %d 次", name, streak)
+        if not failed and name in ("write_file", "append_file", "run_python", "run_command", "tcp_echo_test"):
+            issue = self._completion_issue(task)
+            if issue:
+                obs += "\n\n（当前待完成步骤：" + issue + "）"
         return obs
 
     # ---------- 内部 ----------
+    @staticmethod
+    def _needs_code_work(task):
+        requirements = re.split(r'用户任务[:：]', task, maxsplit=1)[-1]
+        requirements = re.sub(r'(?:不要|无需|不必|禁止)[^，。；\n]{0,60}', '', requirements)
+        return bool(re.search(
+            r'(?:修复|编写|开发|实现|修改)\s*(?:Python|C\+\+|Java|C)?\s*(?:代码|程序|脚本)|'
+            r'(?:创建|开发|实现).{0,12}(?:项目|Python)|(?:运行|执行|单元).{0,4}测试', requirements, re.I))
+
+    @staticmethod
+    def _visible_observation(result):
+        if len(result) <= MAX_OBS_LENGTH:
+            return result
+        half = MAX_OBS_LENGTH // 2
+        return result[:half] + '\n...(中间内容过长已截断，保留末尾错误原因)...\n' + result[-half:]
+
+    def _request_messages(self):
+        research = getattr(self, '_research', None)
+        context = research.context() if research is not None else ''
+        if research is not None and research.document:
+            context = ('Word 生成方式：直接调用 write_file，path 使用 .docx，content 填完整正文；'
+                       'Agent 会自动生成真正的 DOCX 并检查包结构。无需 shell、Python 脚本、'
+                       'python-docx 或安装依赖。先据已有证据产出，不要反复只说准备生成。\n' + context)
+        if not context:
+            return self.messages
+        return self.messages + [{'role': 'user', 'content': context}]
+
+    @staticmethod
+    def _skill_cache_key(skill):
+        try:
+            stat = skill.path.stat()
+            return str(skill.path.resolve()), stat.st_mtime_ns, stat.st_size
+        except OSError:
+            return None
+
     def _auto_skill_hint(self, task: str, cfg=None) -> str:
         """V30 技能自动匹配：任务与技能强匹配时返回规范正文（否则空串）
 
@@ -859,6 +1143,13 @@ class Agent:
             if not matched:
                 return ""
             log.info("技能自动匹配: %s", ", ".join(s.name for s in matched))
+            if hasattr(self, '_loaded_skill_results'):
+                from core.skills import load_skill_text
+                for skill in matched:
+                    key = self._skill_cache_key(skill)
+                    if key is not None:
+                        self._loaded_skill_results[key] = load_skill_text(skill)
+                        self._loaded_skill_names.add(skill.name)
             return "\n\n" + auto_inject_text(matched)
         except Exception as e:
             log.warning("技能自动匹配失败: %s", e)
@@ -975,11 +1266,17 @@ class Agent:
         def _drop_oldest_unit():
             if len(self.messages) <= 2:
                 return False
-            first = self.messages[2]
+            # 保留最近任务；工具历史仍可按组淘汰，不能让长循环无限膨胀。
+            last_user = max((i for i, m in enumerate(self.messages)
+                             if m.get('role') == 'user' and not str(m.get('content') or '').startswith('OBSERVATION')), default=1)
+            start = 3 if last_user == 2 else 2
+            if start >= len(self.messages) - 1:
+                return False
+            first = self.messages[start]
             calls = first.get("tool_calls") or []
             if first.get("role") == "assistant" and calls:
                 ids = {c.get("id") for c in calls if c.get("id")}
-                end = 3
+                end = start + 1
                 seen = set()
                 while end < len(self.messages) and self.messages[end].get("role") == "tool":
                     tid = self.messages[end].get("tool_call_id")
@@ -990,22 +1287,23 @@ class Agent:
                     end += 1
                     if ids and ids.issubset(seen):
                         break
-                del self.messages[2:end]
+                if end == len(self.messages):
+                    return False  # 最近一组执行结果必须保留
+                del self.messages[start:end]
             elif first.get("role") == "tool":
                 # 旧数据或异常历史中的孤立 tool 消息，按连续 tool 块整体清除。
-                while len(self.messages) > 2 and self.messages[2].get("role") == "tool":
-                    self.messages.pop(2)
+                while len(self.messages) > start and self.messages[start].get("role") == "tool":
+                    self.messages.pop(start)
             else:
-                self.messages.pop(2)
+                self.messages.pop(start)
             return True
 
         total = sum(_size(m) for m in self.messages)
         while (len(self.messages) > keep + 1 or total > self.KEEP_CHARS):
             before = len(self.messages)
-            removed = self.messages[2:]
             if not _drop_oldest_unit():
                 break
-            total -= sum(_size(m) for m in removed[:before - len(self.messages)])
+            total = sum(_size(m) for m in self.messages)
 
     # ---------- 解析（小模型友好：本地修复常见 JSON 病，避免浪费重试轮次） ----------
     @staticmethod

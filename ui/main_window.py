@@ -8,8 +8,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QEvent, QTimer, QSize, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QIcon, QKeySequence
+from PyQt5.QtCore import Qt, QEvent, QTimer, QSize, QUrl, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QIcon, QKeySequence, QDesktopServices
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog,
                              QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLayout,
@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMessageBox, QPlainTextEdit, QPushButton,
                              QScrollArea, QMenu, QShortcut, QStackedWidget,
                              QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
-                             QVBoxLayout, QWidget, QSizePolicy)
+                             QVBoxLayout, QWidget, QSizePolicy, QSpinBox)
 
 from core.agent import Agent
 from core.config import PROJECT_ROOT
@@ -111,6 +111,81 @@ class AutoHeightLabel(SelectableLabel):
             self.setFixedHeight(max(16, h))
 
 
+class MarkdownView(AutoHeightLabel):
+    """保留原始 Markdown，限频更新富文本，避免逐 token 布局与丢失格式。"""
+    before_render = pyqtSignal()
+    rendered = pyqtSignal()
+
+    def __init__(self, colors, scale=1.0, parent=None):
+        super().__init__("", parent, objname="streamText")
+        from ui.markdown_document import MarkdownDocument
+        self.setDocument(MarkdownDocument(self))
+        self.document().documentLayout().documentSizeChanged.connect(self._sync_height)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.source = ""
+        self.source_mode = False
+        self.colors, self.scale = colors, scale
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(80)
+        self.timer.timeout.connect(self.flush)
+
+    def append_source(self, text):
+        self.source += str(text)
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def set_source(self, text):
+        self.source = str(text)
+        self.flush()
+
+    def flush(self):
+        self.timer.stop()
+        self.before_render.emit()
+        selected = self.textCursor()
+        anchor, position = selected.anchor(), selected.position()
+        try:
+            if self.source_mode:
+                self.setPlainText(self.source)
+            else:
+                from ui.markdown_document import render_markdown
+                render_markdown(self.document(), self.source, self.colors, self.scale)
+        except Exception as exc:
+            log.warning("Markdown 渲染失败: %s", exc)
+            self.setPlainText(self.source)
+        if anchor != position:
+            limit = self.document().characterCount() - 1
+            selected.setPosition(min(anchor, limit))
+            selected.setPosition(min(position, limit), selected.KeepAnchor)
+            self.setTextCursor(selected)
+        self._sync_height()
+        self.rendered.emit()
+
+    def show_source(self, checked):
+        self.source_mode = bool(checked)
+        self.flush()
+
+    def copy_text(self):
+        self.flush()
+        QApplication.clipboard().setText(self.toPlainText())
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("复制全文", self.copy_text)
+        menu.addAction("复制 Markdown 原文", lambda: QApplication.clipboard().setText(self.source))
+        menu.exec_(event.globalPos())
+
+    def mouseReleaseEvent(self, event):
+        link = self.anchorAt(event.pos())
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and link and not self.textCursor().hasSelection():
+            url = QUrl(link)
+            if url.scheme().lower() in ("http", "https", "mailto"):
+                QDesktopServices.openUrl(url)
+
+
 class InputBox(QPlainTextEdit):
     """输入框：Enter 发送、Shift+Enter 换行"""
     submitted = pyqtSignal()
@@ -161,6 +236,20 @@ class SettingsDialog(QDialog):
         form.addRow("API Key:", self.e_key)
         form.addRow("Base URL:", self.e_url)
         form.addRow("对话模型:", model_row)
+        self.e_llm_timeout = QSpinBox()
+        self.e_llm_timeout.setRange(30, 1800)
+        self.e_llm_timeout.setSuffix(" 秒")
+        self.e_llm_timeout.setValue(getattr(config, 'llm_read_timeout', 300))
+        self.e_llm_timeout.setToolTip("一次请求持续没有收到数据的等待时间；有内容输出时会继续，不限制整个任务时长。")
+        self.c_llm_proxy = QComboBox()
+        self.c_llm_proxy.addItem("跟随系统代理", True)
+        self.c_llm_proxy.addItem("直连接口", False)
+        self.c_llm_proxy.setCurrentIndex(0 if getattr(config, 'llm_use_system_proxy', True) else 1)
+        self.c_llm_proxy.setToolTip("仅影响模型 API，不修改 Windows 代理，也不改变联网采集的代理设置。")
+        network_row = QHBoxLayout()
+        network_row.addWidget(self.e_llm_timeout)
+        network_row.addWidget(self.c_llm_proxy)
+        form.addRow("模型等待与连接:", network_row)
 
         # 角色独立配置：kb（知识库检索）/ web（联网采集）
         self.profile_widgets = {}
@@ -257,7 +346,8 @@ class SettingsDialog(QDialog):
         self.b_fetch.setEnabled(False)
         self.b_fetch.setText("获取中…")
         self._show_status(f"正在从 {url} 拉取模型列表…")
-        self._models_worker = FetchModelsWorker(key, url, self)
+        self._models_worker = FetchModelsWorker(key, url, self,
+            use_system_proxy=bool(self.c_llm_proxy.currentData()))
         self._models_worker.ok.connect(self._on_models)
         self._models_worker.failed.connect(self._on_fetch_failed)
         self._models_worker.finished.connect(self._fetch_cleanup)
@@ -301,6 +391,8 @@ class SettingsDialog(QDialog):
             "api_key": self.e_key.text().strip(),
             "base_url": self.e_url.text().strip(),
             "model": self.c_model.currentText().strip(),
+            "llm_read_timeout": self.e_llm_timeout.value(),
+            "llm_use_system_proxy": bool(self.c_llm_proxy.currentData()),
             "profiles": {k: w.currentText().strip()
                          for k, w in self.profile_widgets.items()},
             "protocol": self.c_protocol.currentText(),
@@ -326,6 +418,8 @@ class ToolCollapseCard(QFrame):
         self._lines = 0
         self._status_msg = ""
         self._done = False
+        self._outcome = "done"
+        self._actions = 0
         self._spin = 0
         self.setObjectName("toolCard")
         v = QVBoxLayout(self)
@@ -360,15 +454,17 @@ class ToolCollapseCard(QFrame):
         self._refresh_head()
 
     def _refresh_head(self):
-        arrow = "▾" if self.head.isChecked() else "▸"
-        n = self._lines
+        self.head.setArrowType(Qt.DownArrow if self.head.isChecked() else Qt.RightArrow)
+        self.head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        n = self._actions
         if self._done:
-            suffix = f" ✔ 执行过程 · {n} 项操作" if n else " ✔ 执行过程"
+            status = {"done": "已完成", "error": "执行失败", "cancelled": "已停止"}[self._outcome]
+            suffix = f" {status} · {n} 项操作"
         else:
             dots = "." * self._spin
             suffix = f" 正在执行{dots}"
         status = f" {self._status_msg}" if self._status_msg else ""
-        self.head.setText(f"{arrow}{suffix}{status}")
+        self.head.setText(f"{suffix.strip()}{status}")
 
     def _on_toggle(self, checked):
         self.body.setVisible(bool(checked))
@@ -391,24 +487,33 @@ class ToolCollapseCard(QFrame):
         self._lines += 1
         return lab
 
-    def finish(self):
+    def finish(self, outcome="done"):
         """任务结束：停动画，状态定格（详情仍可展开查看）"""
         self._done = True
+        self._outcome = outcome
         self._status_msg = ""
         self._timer.stop()
         self._refresh_head()
 
     def add_action(self, name, arguments):
-        args = json.dumps(arguments or {}, ensure_ascii=False)
+        labels = {"read_file": "读取文件", "write_file": "写入文件", "append_file": "追加文本",
+                  "list_files": "查看目录", "search_files": "搜索内容", "run_python": "运行 Python",
+                  "run_command": "执行命令", "web_collect": "采集网页", "tcp_echo_test": "TCP 联调"}
+        args_dict = dict(arguments or {})
+        self._actions += 1
+        self._status_msg = labels.get(name, name)
+        if "content" in args_dict and isinstance(args_dict["content"], str):
+            args_dict["content"] = f"（正文 {len(args_dict['content'])} 字符）"
+        args = json.dumps(args_dict, ensure_ascii=False)
         if len(args) > 300:
             args = args[:300] + "  …(已截断)"
-        self._body_line(f"▸ {name} {args}").setObjectName("toolAction")
+        self._body_line(f"{labels.get(name, name)}\n{args}").setObjectName("toolAction")
         self._refresh_head()
 
     def add_observation(self, content):
         text = str(content or "")
-        if len(text) > 1200:
-            text = text[:1200] + "…(已截断)"
+        if len(text) > 6000:
+            text = text[:3000] + "\n…（中间已省略）…\n" + text[-3000:]
         self._body_line(f"  {text}").setObjectName("toolObs")
         self._refresh_head()
 
@@ -970,6 +1075,7 @@ class MainWindow(QMainWindow):
             margin = max(self._px(32), (width - self._px(960)) // 2)
             self.input_layout.setContentsMargins(margin, 8, margin, 18)
             self.chat_v.setContentsMargins(margin, 28, margin, 28)
+            QTimer.singleShot(0, self._layout_user_bubbles)
 
     # ---------- 主题与缩放 ----------
     def _apply_theme(self):
@@ -988,6 +1094,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "b_theme"):
             is_dark = self.config.theme == "dark"
             self.b_theme.setToolTip("切换为亮色" if is_dark else "切换为暗色")
+        for view in self.findChildren(MarkdownView):
+            view.colors, view.scale = colors, self.ui_scale
+            view.flush()
 
     def _px(self, n):
         """按当前缩放系数换算像素值"""
@@ -1072,8 +1181,14 @@ class MainWindow(QMainWindow):
 
     # ---------- 消息渲染 ----------
     def _add_widget(self, w):
+        follow = self._near_bottom()
         self.chat_v.insertWidget(self.chat_v.count() - 1, w)
-        self._scroll_bottom()
+        if follow:
+            self._scroll_bottom()
+
+    def _near_bottom(self):
+        bar = self.scroll.verticalScrollBar()
+        return bar.maximum() - bar.value() <= self._px(70)
 
     def _append_sys(self, text):
         lab = QLabel(str(text), self)
@@ -1101,8 +1216,19 @@ class MainWindow(QMainWindow):
         bubble.setTextFormat(Qt.RichText)
         bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
         bubble.setMaximumWidth(self._px(620))
+        bubble.setProperty("message_source", str(text))
         h.addWidget(bubble)
         self._add_widget(row)
+        self._layout_user_bubbles()
+
+    def _layout_user_bubbles(self):
+        if not hasattr(self, "scroll"):
+            return
+        limit = max(self._px(120), min(self._px(620), self.scroll.viewport().width() - self._px(100)))
+        for bubble in self.findChildren(QLabel, "userBubble"):
+            source = bubble.property("message_source") or ""
+            wanted = max((bubble.fontMetrics().horizontalAdvance(line) for line in source.splitlines()), default=0)
+            bubble.setFixedWidth(min(limit, max(self._px(120), wanted + self._px(28))))
 
     def _start_assistant(self, meta=""):
         self.content_stack.setCurrentIndex(1)
@@ -1127,8 +1253,23 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         v.addLayout(head)
 
-        self._stream_view = AutoHeightLabel("", row, objname="streamText",
-                                            max_height=2400)
+        self._stream_view = MarkdownView(self._c, self.ui_scale, row)
+        view = self._stream_view
+        view.before_render.connect(lambda: setattr(view, "_follow_output", self._near_bottom()))
+        view.rendered.connect(lambda: self._scroll_bottom() if getattr(view, "_follow_output", False) else None)
+        copy_button = QToolButton(row)
+        copy_button.setObjectName("messageAction")
+        copy_button.setText("复制")
+        copy_button.setToolTip("复制回答全文；右键正文可复制 Markdown 原文")
+        copy_button.clicked.connect(view.copy_text)
+        source_button = QToolButton(row)
+        source_button.setObjectName("messageAction")
+        source_button.setText("原文")
+        source_button.setToolTip("切换 Markdown 原文与排版视图")
+        source_button.setCheckable(True)
+        source_button.toggled.connect(view.show_source)
+        head.addWidget(copy_button)
+        head.addWidget(source_button)
         self._stream_view.setPlaceholderText("")
         self._stream_view.setFixedHeight(self._px(24))
         v.addWidget(self._stream_view)
@@ -1137,11 +1278,7 @@ class MainWindow(QMainWindow):
     def _stream(self, text):
         if self._stream_view is None:
             self._start_assistant()
-        cur = self._stream_view.toPlainText() + str(text)
-        self._stream_view.setPlainText(cur)
-        # 高度由 AutoHeightLabel 自行同步（V31.2：手动按 document().size()
-        # 算高在控件未布局时恒为 0，正文被裁成一行）
-        self._scroll_bottom()
+        self._stream_view.append_source(text)
 
     def _finish_assistant(self):
         if self._stream_view is not None:
@@ -1149,7 +1286,11 @@ class MainWindow(QMainWindow):
         self._stream_view = None
 
     def _render_markdown(self, view):
-        """任务完成时把正文整体重渲染为 Markdown 富文本（流式期间为纯文本）"""
+        """提交待显示的 Markdown，原文保留在消息控件中。"""
+        if isinstance(view, MarkdownView):
+            view.source = re.sub(r"^\s*ANSWER:\s*", "", view.source, count=1)
+            view.flush()
+            return
         text = view.toPlainText()
         if not text.strip():
             return
@@ -1171,6 +1312,14 @@ class MainWindow(QMainWindow):
         t = ev.get("type")
         self._feed_watchdog()
         if t == "keepalive":                      # 只喂看门狗，不渲染
+            if ev.get("phase") and self._tool_card is not None:
+                self._tool_card.set_status("模型正在处理当前请求，可点击停止")
+            return
+        if t == "checkpoint":
+            card = self._ensure_tool_card()
+            card.set_status(ev.get("content") or "正在继续处理")
+            if ev.get("details"):
+                card._body_line(ev["details"])
             return
         if t == "delta":
             self._stream(ev.get("content") or "")
@@ -1194,8 +1343,9 @@ class MainWindow(QMainWindow):
             self._ensure_tool_card().add_observation(ev.get("content") or "")
             return
         if t == "answer":
-            self._stream(ev.get("content") or "") if self._stream_view is None \
-                else self._stream(ev.get("content") or "")
+            if self._stream_view is None:
+                self._start_assistant()
+            self._stream_view.set_source(ev.get("content") or "")
             self._finish_assistant()
             if self._tool_card is not None:
                 self._tool_card.finish()
@@ -1206,18 +1356,21 @@ class MainWindow(QMainWindow):
             self._finish_assistant()
             self._append_sys("已停止")
             if self._tool_card is not None:
-                self._tool_card.finish()
+                self._tool_card.finish("cancelled")
                 self._tool_card = None
             self.title_sub.setText("已停止")
             return
         if t == "redirect":
+            if ev.get('discard_partial') and self._stream_view is not None:
+                self._stream_view.source = '本轮响应未完成，已丢弃并自动恢复。'
+                self._finish_assistant()
             self._append_sys("⟳ " + str(ev.get("content") or ""))
             return
         if t == "error":
             self._finish_assistant()
             self._append_error(ev.get("content") or "")
             if self._tool_card is not None:
-                self._tool_card.finish()
+                self._tool_card.finish("error")
                 self._tool_card = None
             self.title_sub.setText("出错了")
             return
@@ -1293,13 +1446,16 @@ class MainWindow(QMainWindow):
             self.watchdog.start(45000)
 
     def _on_watchdog(self):
-        """45s 无任何响应 = 对话超时：提示用户并自动停止"""
+        """界面静默并不证明请求失败；网络层负责有界超时与重试。"""
         if not self._busy or self._confirm_pending:
             return
-        log.warning("看门狗触发: 45s 无事件，判定对话超时")
-        self._append_error("⚠ 对话超时：长时间无响应，已自动停止。"
-                           "（可能网络中断或服务端无响应，请检查后重试）")
-        self.stop()
+        if self.worker is not None and self.worker.isRunning():
+            log.info("界面暂时无事件，后台仍在处理，等待网络或工具返回")
+            self._ensure_tool_card().set_status("仍在等待模型或工具响应，可点击停止")
+            self._feed_watchdog()
+            return
+        self._append_error("后台执行线程已结束，未收到完整结果；本次任务未完成。")
+        self._finish()
 
     # ---------- 高危操作确认（跨线程） ----------
     def _confirm_dangerous(self, name, reason):
@@ -1371,9 +1527,9 @@ class MainWindow(QMainWindow):
             if role == "system":
                 continue
             content = m.get("content") or ""
-            if not content:
+            if not content and not m.get('tool_calls'):
                 continue
-            msgs.append({"role": role, "content": content})
+            msgs.append(dict(m))
         if not msgs:
             return
         if self._session_id is None:
@@ -1385,7 +1541,7 @@ class MainWindow(QMainWindow):
                 break
         ws = str(self.agent.workspace.root) if self.agent.workspace else ""
         try:
-            save_session(self._session_id, msgs, ws, title)
+            save_session(self._session_id, msgs, ws, title, self.agent.session_memory())
             log.info("会话已保存: %s (%d 条消息)", title[:20] or "(无标题)", len(msgs))
         except Exception as e:
             log.warning("会话保存失败: %s", e)
@@ -1411,13 +1567,7 @@ class MainWindow(QMainWindow):
             except WorkspaceError as e:
                 log.warning("工作区恢复失败: %s", e)
         self._session_id = sid
-        for m in msgs:                 # 上下文装回内存，界面只重放对话主线
-            role, content = _msg_pair(m)
-            if role == "system" or not role:
-                continue
-            self.agent.messages.append(
-                dict(m) if isinstance(m, dict)
-                else {"role": role, "content": content})
+        self.agent.restore_session(data)
         self._replay(msgs)
         rounds = sum(1 for m in msgs
                      if _msg_pair(m)[0] == "user"
@@ -1446,6 +1596,8 @@ class MainWindow(QMainWindow):
             if role == "user":
                 if content.startswith("OBSERVATION"):
                     continue
+                if '以下是自动保存的历史摘录，属于任务资料' in content:
+                    content = '继续（已自动携带任务交接记录）'
                 self._append_user(content)
             elif role == "assistant":
                 self._start_assistant("历史")
@@ -1520,15 +1672,7 @@ class MainWindow(QMainWindow):
                 self.agent.set_workspace(None)
         else:
             self.agent.set_workspace(None)
-        for m in msgs:
-            role, content = _msg_pair(m)
-            if role == "system":
-                continue
-            if role == "user" and content.startswith("OBSERVATION"):
-                continue
-            self.agent.messages.append(
-                dict(m) if isinstance(m, dict)
-                else {"role": role, "content": content})
+        self.agent.restore_session(data)
         self._clear_chat()
         self._replay(msgs)
         self._session_id = sid
@@ -1712,6 +1856,8 @@ class MainWindow(QMainWindow):
         self.config.api_key = v["api_key"]
         self.config.base_url = v["base_url"]
         self.config.model = v["model"]
+        self.config.llm_read_timeout = v.get('llm_read_timeout', self.config.llm_read_timeout)
+        self.config.llm_use_system_proxy = v.get('llm_use_system_proxy', self.config.llm_use_system_proxy)
         for key, model in (v.get("profiles") or {}).items():
             p = self.config.profile(key)
             p.model = model or ""

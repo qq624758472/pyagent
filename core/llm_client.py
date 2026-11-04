@@ -1,7 +1,11 @@
 """LLM 客户端：OpenAI 兼容 /chat/completions，SSE 流式"""
 import json
+import queue
 import re
+import threading
 import time
+from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 import requests
 
@@ -12,6 +16,11 @@ log = get_logger("core.llm_client")
 
 
 class LLMError(Exception):
+    pass
+
+
+class LLMStreamInterrupted(LLMError):
+    """已收到部分响应后网络中断；调用方必须丢弃本轮片段后才能重新请求。"""
     pass
 
 
@@ -42,6 +51,63 @@ class LLMClient:
         self.api_key = p.api_key or cfg.api_key
         self.last_reasoning = ""    # 最近一次流式的思考内容（无正文时的诊断用）
         self.reasoning_fallback_used = False   # 最近一次是否用思考过程兜底当回复
+        self._request_lock = threading.Lock()
+        self._active_requests = set()
+
+    def _timeouts(self, timeout=None):
+        if timeout is not None:
+            return timeout
+        try:
+            seconds = int(getattr(self.cfg, 'llm_read_timeout', 300))
+        except (TypeError, ValueError):
+            seconds = 300
+        return 10, max(30, min(1800, seconds))
+
+    @contextmanager
+    def _api_request(self, method, url, **kwargs):
+        # 不修改操作系统代理；一个请求一个 Session，避免取消后的读取线程影响新任务。
+        with requests.Session() as session:
+            session.trust_env = bool(getattr(self.cfg, 'llm_use_system_proxy', True))
+            with session.request(method, url, **kwargs) as response:
+                yield response
+
+    def _route_label(self, url):
+        if not getattr(self.cfg, 'llm_use_system_proxy', True):
+            return '直连接口'
+        proxies = requests.utils.get_environ_proxies(url)
+        proxy = proxies.get(urlsplit(url).scheme) or proxies.get('all')
+        if proxy:
+            parsed = urlsplit(proxy)
+            return f'系统代理 {parsed.hostname}:{parsed.port or 80}'
+        return '系统路由（当前无代理）'
+
+    @staticmethod
+    def _is_read_timeout(error):
+        return isinstance(error, requests.ReadTimeout) or 'read timed out' in str(error).lower()
+
+    @staticmethod
+    def _compact_retry_payload(payload):
+        """只压缩旧对话；保留任务及最近完整的 tool_calls/tool 组，不改调用方历史。"""
+        messages = payload.get('messages') or []
+        units, i = [], 2
+        while i < len(messages):
+            start = i
+            i += 1
+            if messages[start].get('role') == 'assistant' and messages[start].get('tool_calls'):
+                while i < len(messages) and messages[i].get('role') == 'tool':
+                    i += 1
+            units.append(messages[start:i])
+        if len(units) <= 2:
+            return payload
+        reduced = messages[:2] + [message for unit in units[-2:] for message in unit]
+        old_size = len(json.dumps(messages, ensure_ascii=False))
+        new_size = len(json.dumps(reduced, ensure_ascii=False))
+        if new_size >= old_size * 0.8:
+            return payload
+        reduced.append({'role': 'user', 'content': (
+            '上一次模型请求读取超时，已缩短较早的工具历史。保留原任务、最近结果和已生成文件，'
+            '继续未完成工作。缺失资料时重新读取相关文件，不要重建已完成产物；实际验证后再总结。')})
+        return dict(payload, messages=reduced)
 
     def _payload(self, messages, model=None):
         name = model or self.model
@@ -54,6 +120,72 @@ class LLMClient:
         return payload
 
     def _iter_sse(self, payload, m_desc, timeout=None):
+        """将阻塞网络读取与事件流分开：等待首字节时也可取消和发送等待状态。"""
+        cancelled = threading.Event()
+        events = queue.Queue(maxsize=128)
+        with self._request_lock:
+            self._active_requests.add(cancelled)
+
+        def send(item):
+            while not cancelled.is_set():
+                try:
+                    events.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+        def read():
+            try:
+                for item in self._read_sse(payload, m_desc, timeout, cancelled):
+                    if cancelled.is_set():
+                        return
+                    send(item)
+            except Exception as exc:
+                send(("error", exc))
+            finally:
+                send(("done", None))
+
+        reader = threading.Thread(target=read, name="llm-network", daemon=True)
+        reader.start()
+        connect, read_timeout = self._timeouts(timeout)
+        # 既保留已有重试预算，也限制一直发送无效/心跳数据的服务器。
+        budget = connect + read_timeout * (1 + self.RETRY_ON_CONN) + self.RETRY_BACKOFF * 3
+        deadline = time.monotonic() + budget
+        last_wait = time.monotonic()
+        try:
+            while True:
+                if cancelled.is_set():
+                    raise LLMError("模型请求已取消")
+                if time.monotonic() >= deadline:
+                    raise LLMError("模型请求超过网络等待与重试预算，任务未完成；已保留工作区文件。")
+                try:
+                    kind, data = events.get(timeout=0.1)
+                except queue.Empty:
+                    if time.monotonic() - last_wait >= self.REASONING_BEAT:
+                        last_wait = time.monotonic()
+                        yield ("waiting", "")
+                    continue
+                if cancelled.is_set():
+                    raise LLMError("模型请求已取消")
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise data
+                if kind in ('content', 'reasoning', 'tool_delta'):
+                    deadline = time.monotonic() + budget  # 有真实数据时继续，不限制整条回复总时长。
+                yield kind, data
+        finally:
+            cancelled.set()
+            with self._request_lock:
+                self._active_requests.discard(cancelled)
+
+    def cancel_pending(self):
+        """立即结束消费端；正在阻塞的 HTTP 读取按其超时释放，禁止再重试。"""
+        with self._request_lock:
+            for request in self._active_requests:
+                request.set()
+
+    def _read_sse(self, payload, m_desc, timeout=None, cancelled=None):
         """底层 SSE 迭代：产出 ("content"|"reasoning", 文本) 与 ("tool_delta", 片段列表)
 
         连接中断或可恢复的 HTTP 5xx 在尚未产出正文/工具调用时重试；其他 HTTP 错误不重试。
@@ -62,15 +194,19 @@ class LLMClient:
         url = self.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}",
                    "Content-Type": "application/json"}
-        req_timeout = timeout or (10, 180)
+        req_timeout = self._timeouts(timeout)
         chunks = 0
         for attempt in range(1 + self.RETRY_ON_CONN):
+            if cancelled is not None and cancelled.is_set():
+                return
             try:
-                with requests.post(url, headers=headers, json=payload,
-                                   stream=True, timeout=req_timeout) as r:
+                with self._api_request('POST', url, headers=headers, json=payload,
+                                       stream=True, timeout=req_timeout) as r:
                     r.raise_for_status()
                     r.encoding = "utf-8"
-                    for line in r.iter_lines(decode_unicode=True):
+                    for line in r.iter_lines(chunk_size=1, decode_unicode=True):
+                        if cancelled is not None and cancelled.is_set():
+                            return
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[5:].strip()
@@ -98,6 +234,8 @@ class LLMClient:
                             yield ("tool_delta", tc)
                 break                   # 正常完成，跳出重试循环
             except requests.HTTPError as e:
+                if cancelled is not None and cancelled.is_set():
+                    return
                 code = e.response.status_code if e.response is not None else "?"
                 detail = ""
                 if e.response is not None:
@@ -115,20 +253,42 @@ class LLMClient:
                     wait = self.RETRY_BACKOFF * (attempt + 1)
                     log.warning("LLM HTTP %s，%.1fs 后重试(%d/%d)",
                                 code, wait, attempt + 1, self.RETRY_ON_CONN)
-                    time.sleep(wait)
+                    if cancelled is not None:
+                        if cancelled.wait(wait):
+                            return
+                    else:
+                        time.sleep(wait)
                     continue
                 log.error("LLM 请求失败 %s HTTP %s", m_desc, code)
                 suffix = f"；服务端信息: {detail}" if detail else ""
                 raise LLMError(
                     f"API 请求失败(HTTP {code})，请检查 base_url/api_key/模型名。{suffix}") from e
             except requests.RequestException as e:
+                if cancelled is not None and cancelled.is_set():
+                    return
                 if chunks > 0 or attempt >= self.RETRY_ON_CONN:
                     log.error("LLM 网络错误 %s: %s", m_desc, brief(e, 200))
-                    raise LLMError(f"网络错误: {e}") from e
+                    if self._is_read_timeout(e):
+                        error_type = LLMStreamInterrupted if chunks else LLMError
+                        raise error_type(
+                            f"模型读取超时（{self._route_label(url)}，单次等待 {req_timeout[1]} 秒）。"
+                            + ("响应中途断开，未重复提交这轮请求。" if chunks else f"已重试 {attempt} 次仍未收到完整响应。")
+                            + "任务未完成，文件已保留。可在设置中调整等待时间或选择直连接口，并检查模型服务负载。") from e
+                    error_type = LLMStreamInterrupted if chunks else LLMError
+                    raise error_type(f"网络错误: {e}") from e
                 wait = self.RETRY_BACKOFF * (attempt + 1)
+                if self._is_read_timeout(e):
+                    compact = self._compact_retry_payload(payload)
+                    changed = compact is not payload
+                    payload = compact
+                    yield ('retry', f"模型读取超时，{'已缩短历史，' if changed else ''}准备重试 {attempt + 1}/{self.RETRY_ON_CONN}（{self._route_label(url)}）")
                 log.warning("LLM 网络错误，%.1fs 后重试(%d/%d): %s",
                             wait, attempt + 1, self.RETRY_ON_CONN, brief(e, 150))
-                time.sleep(wait)
+                if cancelled is not None:
+                    if cancelled.wait(wait):
+                        return
+                else:
+                    time.sleep(wait)
 
     def chat_stream(self, messages, model=None, timeout=None, on_activity=None):
         """文本协议流：产出正文增量（str）。reasoning 单独收集，空正文时兜底。
@@ -147,10 +307,13 @@ class LLMClient:
         t0 = time.monotonic()
         chunks = 0
         reasoning_buf = []           # reasoning_content 累积（gpt-oss/deepseek-r1 等）
+        last_activity_beat = t0
         self.last_reasoning = ""
         self.reasoning_fallback_used = False
         for kind, data in self._iter_sse(payload, m_desc, timeout=timeout):
-            if kind == "content":
+            if kind in ("waiting", "retry"):
+                yield ""  # Agent 将其转换成 keepalive，不计作正文或进展。
+            elif kind == "content":
                 chunks += 1
                 yield data
             elif kind == "reasoning":
@@ -160,6 +323,9 @@ class LLMClient:
                         on_activity()
                     except Exception:
                         pass
+                if time.monotonic() - last_activity_beat >= self.REASONING_BEAT:
+                    last_activity_beat = time.monotonic()
+                    yield ""
         self.last_reasoning = "".join(reasoning_buf)
         log.info("LLM 响应完成 %s chunks=%d 用时 %.1fs",
                  m_desc, chunks, time.monotonic() - t0)
@@ -204,6 +370,13 @@ class LLMClient:
         content_parts, reasoning_parts = [], []
         last_beat = t0
         for kind, data in self._iter_sse(payload, m_desc, timeout=timeout):
+            if kind == 'retry':
+                yield {'type': 'progress', 'content': data}
+                continue
+            now = time.monotonic()
+            if kind == "waiting" or now - last_beat >= self.REASONING_BEAT:
+                last_beat = now
+                yield {"type": "keepalive", "phase": "waiting" if kind == "waiting" else "receiving"}
             if kind == "content":
                 content_parts.append(data)
                 yield {"type": "content", "text": data}
@@ -249,9 +422,9 @@ class LLMClient:
         data = None
         for attempt in range(2):                 # 连接类错误重试一次
             try:
-                r = requests.get(url, headers=headers, timeout=(10, 30))
-                r.raise_for_status()
-                data = r.json()
+                with self._api_request('GET', url, headers=headers, timeout=(10, 30)) as r:
+                    r.raise_for_status()
+                    data = r.json()
                 break
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else "?"

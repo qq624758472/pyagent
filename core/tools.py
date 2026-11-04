@@ -97,7 +97,8 @@ TOOL_SCHEMAS = {
                               "找代码符号/函数名时直接填关键字，如 g_eop_info"),
         "content": ("boolean", "true=在文件内容中搜索该关键字；"
                               "false 或省略=按文件名匹配。找代码符号请填 true"),
-        "path": ("string", "可选：限定在某个子目录内搜索，默认整个工作区")}),
+        "path": ("string", "可选：限定在指定文件或子目录内搜索，默认整个工作区"),
+        "regex": ("boolean", "可选：true 按正则表达式搜索内容，默认 false 使用普通关键词")}),
     "run_command": _schema({
         "command": ("string", "要执行的 shell 命令")}, ["command"]),
     "web_collect": _schema({
@@ -124,7 +125,7 @@ TOOL_SCHEMAS = {
         "port": ("integer", "服务器监听端口，默认 12345"),
         "host": ("string", "回环地址，默认 127.0.0.1")}),
     "load_skill": _schema({
-        "name": ("string", "技能名，如 'pdf-report'"),
+        "name": ("string", "技能准确名称，如 report-writer；也支持 skill_report_writer 工具名"),
         "path": ("string", "可选：技能自带参考文件的相对路径")}),
     "install_skill": _schema({
         "url": ("string", "git 仓库地址"),
@@ -146,9 +147,13 @@ def openai_tools(include: list = None, cfg=None, ws=None, task: str = "") -> lis
         schema = t.schema or TOOL_SCHEMAS.get(name)
         if not schema:
             continue
+        description = t.description
+        if name == "load_skill":
+            from core.skills import catalog_for_prompt, discover
+            description += "\n" + catalog_for_prompt(discover(cfg, ws))
         out.append({"type": "function",
                     "function": {"name": t.name,
-                                 "description": t.description,
+                                 "description": description,
                                  "parameters": schema}})
     # V30 技能：每个技能一个工具（skill_<slug>）
     try:
@@ -188,14 +193,14 @@ def _read_file(ws, cfg, path, line_start=None, line_end=None, **extra):
     return ws.read_file(path, line_start=line_start, line_end=line_end)
 
 
-@tool("write_file", "创建或覆盖文本文件(自动创建父目录)",
+@tool("write_file", "创建或覆盖文件(自动创建父目录)。.docx 自动将文本/基本Markdown转换为真正的Word文件并校验结构，禁止伪造二进制扩展名",
       {"path": "文件相对路径", "content": "写入的文本内容"})
 def _write_file(ws, cfg, path, content=""):
     _need_ws(ws)
     return ws.write_file(path, content)
 
 
-@tool("append_file", "向文件末尾追加内容",
+@tool("append_file", "向文本文件末尾追加内容；禁止追加.docx等二进制文件，Word请write_file写入完整正文",
       {"path": "文件相对路径", "content": "追加的文本内容"})
 def _append_file(ws, cfg, path, content=""):
     _need_ws(ws)
@@ -224,9 +229,10 @@ def _delete_file(ws, cfg, path, recursive=False, _confirmed=False):
       "关键字找不到时也会自动降级为内容搜索",
       {"pattern": "要搜索的关键字或 glob 通配符（如 *.py）",
        "content": "true=在文件内容中搜索，默认 false（按文件名匹配）",
-       "path": "可选：限定在某个子目录内搜索，默认整个工作区"})
+       "path": "可选：限定在指定文件或子目录内搜索，默认整个工作区",
+       "regex": "可选：true 使用正则表达式搜索内容，默认 false"})
 def _search_files(ws, cfg, pattern=None, content=None, path=None,
-                  recursive=None, **extra):
+                  recursive=None, regex=False, **extra):
     _need_ws(ws)
     # V31.2 容错：小模型常把关键词塞进 content（{"content": "g_eop_info"}）
     # 或漏掉 pattern —— 两种都按「内容搜索」处理，别让整轮迭代死在参数上
@@ -241,7 +247,7 @@ def _search_files(ws, cfg, pattern=None, content=None, path=None,
     if not kw:
         return ("错误: 缺少搜索关键字。请传 pattern，"
                 '如 search_files({"pattern": "g_eop_info", "content": true})。')
-    return ws.search_files(kw, content=mode, path=path)
+    return ws.search_files(kw, content=mode, path=path, regex=regex)
 
 
 @tool("run_command", "在工作区目录内执行 shell 命令(需 allow_shell=true)",
@@ -489,7 +495,8 @@ def _kb_split(query):
 
 @tool("load_skill",
       "加载技能（可复用的操作规范）全文。当任务涉及某个技能的专业流程/规范时"
-      "先加载它，再按规范执行。可用技能会在本工具描述中列出。",
+      "先加载它，再按规范执行。同一任务已加载的规范不要重复加载。"
+      "name 支持 report-writer 或 skill_report_writer。可用技能会在本工具描述中列出。",
       {"name": "技能名，如 'pdf-report'",
        "path": "可选：读取技能自带的参考文件相对路径"})
 def _load_skill(ws, cfg, name="", path=""):
@@ -679,7 +686,7 @@ def tools_description(cfg=None, ws=None, task: str = "") -> str:
         if skills:
             lines.append("- 可用技能（调用对应工具加载完整规范）：")
             for s in skills:
-                lines.append(f"  - {tool_name(s)}: {s.description or '(无描述)'}")
+                lines.append(f"  - {tool_name(s)} / load_skill(name='{s.name}'): {s.description or '(无描述)'}")
     except Exception as e:
         log.warning("技能清单生成失败: %s", e)
     return "\n".join(lines)

@@ -97,7 +97,7 @@ try:
     ]
     sessions.save_session("quality-test", messages, "", "quality")
     data = sessions.load_session("quality-test")
-    counted_check("会话 schema 版本为 2", data.get("schema_version") == 2)
+    counted_check("会话 schema 版本为 3", data.get("schema_version") == 3)
     counted_check("assistant.tool_calls 保留", data["messages"][0].get("tool_calls") == messages[1]["tool_calls"])
     counted_check("tool_call_id 保留", data["messages"][1].get("tool_call_id") == "call-2")
 finally:

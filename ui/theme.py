@@ -155,6 +155,13 @@ def build_qss(c, s=1.0):
     }}
     #assistName {{ color: {c['text']}; font-size: {f(13)}px; font-weight: 700; }}
     #assistMeta {{ color: {c['text3']}; font-size: {f(11)}px; }}
+    QToolButton#messageAction {{
+        background: transparent; color: {c['text2']}; border: 1px solid {c['border']};
+        border-radius: {f(6)}px; padding: {f(3)}px {f(8)}px; font-size: {f(11)}px;
+    }}
+    QToolButton#messageAction:hover, QToolButton#messageAction:checked {{
+        background: {c['hover']}; color: {c['text']};
+    }}
     #assistAvatar {{
         background: {c['avatar_bg']}; color: {c['avatar_fg']};
         border-radius: {f(13)}px; font-size: {f(12)}px; font-weight: 700;

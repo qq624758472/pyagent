@@ -54,6 +54,23 @@ def main():
         win._finish_assistant()
         capture("studio-conversation.png")
         win._clear_chat()
+        win._append_user("检查项目，执行测试并给出 Markdown 结果。")
+        win._ensure_tool_card().add_action("run_python", {"path": "test_app.py"})
+        win._tool_card.add_observation("Ran 4 tests in 0.12s\nOK")
+        win._tool_card.finish()
+        win._start_assistant("检查结果")
+        win._stream("## 项目检查结果\n\n已完成代码检查与测试，当前结果如下。\n\n"
+                    "| 检查项 | 状态 | 说明 |\n| --- | --- | --- |\n"
+                    "| 程序运行 | 通过 | 返回码为 0 |\n| 自动测试 | 通过 | 4 项测试通过 |\n\n"
+                    "### 使用方法\n\n```python\npython app.py add \"整理项目\"\npython app.py list\n```\n\n"
+                    "- **验证结果**：最后一次修改后已重新测试\n"
+                    "- **下一步**：可继续补充更多异常输入的测试\n")
+        win._finish_assistant()
+        capture("studio-markdown-light.png")
+        config.theme = "dark"
+        win._apply_theme()
+        capture("studio-markdown-dark.png")
+        win._clear_chat()
         win.resize(920, 680)
         capture("studio-compact.png")
         # Do not close through MainWindow.closeEvent (which persists sessions).

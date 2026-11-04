@@ -38,11 +38,11 @@ def session_path(sid: str) -> Path:
     return SESSIONS_DIR / f"{sid}.json"
 
 
-def save_session(sid: str, messages, workspace: str, title: str):
+def save_session(sid: str, messages, workspace: str, title: str, continuity=None):
     """messages: Agent.messages（system 消息自动剔除）"""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     data = {
-        "schema_version": 2,
+        "schema_version": 3,
         "id": sid,
         "title": (title or "未命名会话")[:40],
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -54,11 +54,14 @@ def save_session(sid: str, messages, workspace: str, title: str):
     }
     # 置顶标记跨自动归档保留（每轮结束都会重写文件，不能丢）
     prev = load_session(sid) or {}
+    from core.session_context import infer_memory
+    data['continuity'] = continuity if continuity is not None else infer_memory(data['messages'])
     if prev.get("pinned"):
         data["pinned"] = True
     path = session_path(sid)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                    encoding="utf-8")
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    temporary.replace(path)
     _prune()
     log.info("会话已保存: %s (%d 条消息) → %s",
              data["title"][:30], len(data["messages"]), path.name)

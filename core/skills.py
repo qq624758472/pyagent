@@ -348,18 +348,17 @@ def bundle_files(skill: Skill, limit: int = 20) -> list:
 
 
 def find(skills: list, name: str):
-    """按名称查技能（不区分大小写，允许省略连字符/下划线差异）"""
-    n = (name or "").strip()
+    """解析技能名、来源标签或工具名；只接受唯一匹配，不猜测未知技能。"""
+    n = str(name or "").strip().strip('`\"\'')
     if not n:
         return None
     for s in skills:
         if s.name == n:
             return s
-    key = re.sub(r"[\s_\-]+", "", n.lower())
-    for s in skills:
-        if re.sub(r"[\s_\-]+", "", s.name.lower()) == key:
-            return s
-    return None
+    def key(value):
+        return re.sub(r"[\s_\-]+", "", value.casefold())
+    matches = [s for s in skills if key(n) in {key(s.name), key(s.label), key(tool_name(s))}]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ------------------------------------------------------------------
@@ -368,7 +367,8 @@ def find(skills: list, name: str):
 LOAD_SKILL_DESC = (
     "加载技能（可复用的操作规范）全文。当任务涉及某个技能的专业流程/规范"
     "（如特定文档格式、报告模板、既定工作流程）时，先加载对应技能，再按其"
-    "规范执行。传入技能名；也可传 path 读取技能自带的参考文件。"
+    "规范执行。传入技能名（report-writer）或对应工具名（skill_report_writer）；"
+    "同一任务已加载或自动提供的规范不要重复加载。也可传 path 读取技能自带的参考文件。"
 )
 
 
@@ -521,7 +521,8 @@ def dispatch(cfg=None, ws=None, name: str = "", path: str = "") -> str:
                 + catalog(skills))
     skill = find(skills, name)
     if skill is None:
-        return (f"错误: 未找到技能「{name}」。可用技能：\n" + catalog(skills))
+        return (f"错误: 未找到或无法唯一确定技能「{name}」。请使用下列准确名称，"
+                "不要原样重试未知名称。可用技能：\n" + catalog(skills))
     log.info("加载技能: %s（来自 %s）", skill.name, skill.path)
     return load_skill_text(skill, path)
 
@@ -563,7 +564,8 @@ def tool_entries(cfg=None, ws=None, task: str = "") -> list:
             "type": "function",
             "function": {
                 "name": tool_name(s),
-                "description": f"[技能] {desc}",
+                "description": (f"[技能 {s.name}] {desc}。相当于 load_skill(name='{s.name}')；"
+                                "只加载操作规范，不执行任务。已提供规范时直接继续实际工作。"),
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
             "_skill": s,
@@ -573,14 +575,13 @@ def tool_entries(cfg=None, ws=None, task: str = "") -> list:
 
 def resolve_tool(tool_nm: str, cfg=None, ws=None):
     """工具名 → 技能对象（非技能工具返回 None）"""
-    if not tool_nm or not tool_nm.startswith(TOOL_PREFIX):
+    if not tool_nm or not str(tool_nm).casefold().startswith(TOOL_PREFIX):
         return None
     skills = discover(cfg, ws)
-    want = slug(tool_nm[len(TOOL_PREFIX):])
-    for s in skills:
-        if slug(s.name) == want:
-            return s
-    return None
+    matches = [s for s in skills if tool_name(s).casefold() == str(tool_nm).casefold()]
+    if matches:
+        return matches[0] if len(matches) == 1 else None
+    return find(skills, tool_nm)
 
 
 # ------------------------------------------------------------------

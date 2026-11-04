@@ -26,6 +26,9 @@ class AgentWorker(QThread):
 
     def stop(self):
         self._stop.set()
+        cancel = getattr(getattr(self.agent, "llm", None), "cancel_pending", None)
+        if cancel:
+            cancel()
 
     def run(self):
         try:
@@ -48,16 +51,18 @@ class FetchModelsWorker(QThread):
     ok = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, api_key, base_url, parent=None):
+    def __init__(self, api_key, base_url, parent=None, use_system_proxy=True):
         super().__init__(parent)
         self.api_key = api_key
         self.base_url = base_url
+        self.use_system_proxy = use_system_proxy
 
     def run(self):
         try:
             cfg = Config()
             cfg.api_key = self.api_key
             cfg.base_url = self.base_url
+            cfg.llm_use_system_proxy = self.use_system_proxy
             ids = LLMClient(cfg).list_models()
             self.ok.emit(ids)
         except LLMError as e:
