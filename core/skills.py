@@ -177,6 +177,9 @@ def skill_roots(cfg=None, ws=None) -> list:
     if home and home != "~":
         roots.append((Path(home) / ".pyagent" / "skills", "global"))
         roots.append((Path(home) / ".agents" / "skills", "global"))
+    # 用户在当前工作区编写的副本优先于内置/全局同名技能。
+    if ws is not None:
+        roots.append((Path(ws.root) / '.agent' / 'skills','workspace'))
     return roots
 
 

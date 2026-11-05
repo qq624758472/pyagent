@@ -40,11 +40,14 @@ try {
     $env:PYTHONUTF8 = '1'
     $buildFlags = @('--noconfirm', '--workpath', 'build/pyinstaller', '--distpath', 'dist')
     if ($Clean) { $buildFlags += '--clean' }
+    & $pythonExe @pythonPrefix scripts/build_brand_icon.py
+    if ($LASTEXITCODE -ne 0) { throw 'Brand icon generation failed' }
     & $pythonExe @pythonPrefix -m PyInstaller @buildFlags PyAgent.spec
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed' }
-    & $pythonExe @pythonPrefix -c "from pathlib import Path; import hashlib; p=Path('dist/PyAgent.exe'); Path('dist/SHA256.txt').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '  PyAgent.exe\n',encoding='ascii')"
+    Copy-Item -LiteralPath (Join-Path $projectDir 'dist\Zhixing.exe') -Destination (Join-Path $projectDir 'dist\PyAgent.exe') -Force
+    & $pythonExe @pythonPrefix -c "from pathlib import Path; import hashlib; p=Path('dist/Zhixing.exe'); Path('dist/SHA256.txt').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '  Zhixing.exe\n',encoding='ascii')"
     if ($LASTEXITCODE -ne 0) { throw 'EXE was built, but writing SHA256.txt failed.' }
-    Write-Host "Executable: $projectDir\dist\PyAgent.exe"
+    Write-Host "Executable: $projectDir\dist\Zhixing.exe"
 } catch {
     Write-Host "Build failed: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host 'Close any running PyAgent.exe before rebuilding. Existing config and sessions are preserved.'

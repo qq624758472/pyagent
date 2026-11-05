@@ -115,6 +115,7 @@ class Agent:
         self.messages = []          # 对话历史，跨 run 保持（多轮上下文）
         self._session_memory = {"requests": [], "results": []}
         self._research = None
+        self._plan = None
         self._force_text = False    # 端点拒绝 tools 参数后置位，永久回退文本协议
         self._reuse_task_on_fallback = False  # native→text 回退时复用已入历史的任务消息
         self._last_call_sig = None  # 上一轮工具调用签名（V31 重复调用熔断）
@@ -140,10 +141,12 @@ class Agent:
         self.messages.clear()
         self._session_memory = {"requests": [], "results": []}
         self._research = None
+        self._plan = None
 
     def restore_session(self, data):
         from core.session_context import infer_memory, normalize_messages
         self._research = None
+        self._plan = None
         self.messages = normalize_messages(data.get('messages'))
         memory = data.get('continuity')
         self._session_memory = (json.loads(json.dumps(memory)) if isinstance(memory, dict)
@@ -154,6 +157,8 @@ class Agent:
         memory = json.loads(json.dumps(self._session_memory))
         if getattr(self, '_research', None) is not None:
             memory['research'] = self._research.snapshot()
+        if self._plan is not None:
+            memory['plan_id'] = self._plan.data['id']
         for msg in reversed(self.messages):
             if msg.get('role') == 'assistant' and msg.get('content') and not msg.get('tool_calls'):
                 memory['last_reply'] = msg['content'][-1200:]
@@ -211,6 +216,26 @@ class Agent:
             self._initial_word_files = self._word_snapshot() if re.search(r"Word|\.docx", task, re.I) else {}
             from core.research_state import ResearchState
             self._research = ResearchState(task, self._session_memory.get('research') if self._resume_context else None)
+            self._plan = None
+            if self.workspace and not self.qa_mode:
+                from core.task_plan import TaskPlan
+                self._plan = TaskPlan.start(self.workspace, task, self._research.document,
+                                            self._session_memory.get('plan_id') if self._resume_context else None)
+                yield {'type':'plan', 'content':self._plan.describe(), 'path':str(self._plan.directory)}
+            self._manual_skill_rules = ''
+            for name in self._session_memory.get('selected_skills') or []:
+                try:
+                    from core.skills import discover, find, load_skill_text
+                    skill = find(discover(self._config(), self.workspace), name)
+                    if skill:
+                        rules = load_skill_text(skill)
+                        self._manual_skill_rules += '\n\n' + rules
+                        self._loaded_skill_names.add(skill.name)
+                        key=self._skill_cache_key(skill)
+                        if key: self._loaded_skill_results[key]=rules
+                        yield {'type':'skill_loaded', 'content':f'已加载技能：{skill.name}'}
+                except (OSError,ValueError) as exc:
+                    log.warning('手动选择的技能加载失败: %s', exc)
         self._task = task
         # V28 协议分流：native = 原生 function calling（gpt-oss 等思考模型
         # 唯一可靠路径）；text = 原有 ACTION/ANSWER 文本协议
@@ -354,6 +379,7 @@ class Agent:
                 # 仅提问模式：任何输出都按直答处理——不执行工具、不要求重试
                 log.info("仅提问模式：按直答处理（%s）",
                          parsed.get("type") if parsed else "无协议")
+                self._finish_plan()
                 yield {"type": "answer", "content": full.strip()}
                 return
 
@@ -407,10 +433,12 @@ class Agent:
                                       "已要求模型改用工具实际执行"}
                     continue
                 log.info("无 ACTION 协议 → 按直答处理")
+                self._finish_plan()
                 yield {"type": "answer", "content": self._clean_answer(full)}
                 return
             if parsed["type"] == "answer":
                 log.info("ANSWER: %s", brief(parsed["content"], 600))
+                self._finish_plan()
                 yield {"type": "answer", "content": parsed["content"]}
                 return
             if parsed["type"] == "bad_action":      # 有 ACTION 意图但格式坏，要求重试
@@ -516,6 +544,9 @@ class Agent:
                               'append_file', 'create_dir', 'load_skill'}
             tools = [t for t in tools if t['function']['name'] in document_tools
                      or _is_skill_tool(t['function']['name'])]
+        if self._plan is not None:
+            from core.task_plan import tool_specs
+            tools += tool_specs()
         empty_streak = 0
         loaded_skills = []           # 本任务已加载的技能（V30）
         written = {}                 # 本任务写入的文件（落盘追踪，原生路径同样适用）
@@ -547,8 +578,15 @@ class Agent:
             yield {"type": "keepalive"}        # 喂看门狗：覆盖「组消息 → 首 token」静默窗口
             try:
                 phase_tools = tools
+                if self._plan is not None:
+                    allowed=self._plan.allowed_tools()
+                    if allowed is not None:
+                        phase_tools=[t for t in phase_tools if t['function']['name'] in allowed]
                 if self._research.drafting:
-                    phase_tools = [t for t in tools if t['function']['name'] not in self._research.TOOLS]
+                    phase_tools = [t for t in phase_tools if t['function']['name'] not in self._research.TOOLS]
+                if self._plan is not None and self._plan.data.get('needs_refinement'):
+                    phase_tools=[t for t in tools if t['function']['name'] in ('set_plan','task_status','load_skill','list_files')
+                                 or _is_skill_tool(t['function']['name'])]
                 for ev in self.llm.chat_turn(self._request_messages(), tools=phase_tools):
                     if should_stop and should_stop():
                         yield {"type": "cancelled"}
@@ -691,6 +729,7 @@ class Agent:
                     continue
                 self._append_assistant_history(text)
                 log.info("ANSWER: %s", brief(text, 600))
+                self._finish_plan()
                 yield {"type": "answer", "content": text}
                 return
             # 空回合：不消耗迭代配额（V31），MAX_EMPTY_RETRIES 封顶
@@ -770,6 +809,10 @@ class Agent:
                 status = (f'已运行 {step} 轮，当前阶段：{phase}。已跟踪 Word 文件 {len(self._document_outputs)} 个。'
                           f'最近错误：{self._last_failure or "无"}。'
                           '已有资料先形成实际草稿，再补充缺失证据；生成目标 Word 后检查结构与正文。')
+            if self._plan is not None:
+                current=self._plan.current()
+                phase = current['title'] if current else '任务验收完成'
+                status=self._plan.describe()
             self.messages.append({"role": "user", "content": status})
             self._trim_history()
             log.info("任务检查点: %s", status)
@@ -789,6 +832,10 @@ class Agent:
         return files
 
     def _completion_issue(self, task):
+        if self._plan is not None:
+            issue=self._plan.completion_issue()
+            if issue:
+                return issue
         from core.word_documents import DocumentError, inspect_docx
         documents = getattr(self, "_document_outputs", {})
         wants_word = bool(re.search(
@@ -977,6 +1024,28 @@ class Agent:
         repeat: 该「工具+参数」签名连续重复的次数；streak: 同一工具连续调用
         的次数（无论参数）。超过阈值时在观察结果里注入换思路警告（V31）。"""
         t0 = time.monotonic()
+        from core.tools import _READONLY_ALIASES
+        name = _READONLY_ALIASES.get(name, name)
+        if self._plan is not None:
+            from core.task_plan import PLAN_TOOLS
+            if name in PLAN_TOOLS:
+                before_count=sum(s['status']=='completed' for s in self._plan.data['steps'])
+                result=self._plan.execute(name,arguments)
+                if result.startswith('错误'):
+                    self._last_failure=result[-1000:]
+                elif sum(s['status']=='completed' for s in self._plan.data['steps'])>before_count:
+                    self._idle_rounds=0
+                    self._last_failure=''
+                    if name=='assemble_document':
+                        path=self.workspace.resolve(self._plan.data['target'])
+                        self._document_outputs[str(path)]=path
+                        self._research.authored()
+                return result
+            try: guard=self._plan.guard(name,arguments)
+            except WorkspaceError as exc: guard='错误: '+str(exc)
+            if guard:
+                self._last_failure=guard[:1000]
+                return guard
         if (self._research.drafting and name in self._research.TOOLS
                 and not (name == 'read_file' and str(arguments.get('path') or '').lower().endswith('.docx'))):
             return ('OBSERVATION: 已进入生成文档阶段，本次未重复读取资料。'
@@ -1004,6 +1073,8 @@ class Agent:
         result = execute_tool(name, self.workspace, self._config(),
                               arguments, progress=progress, confirm=confirm,
                               should_stop=should_stop, approved=approved)
+        if self._plan is not None:
+            self._plan.observe(name,arguments,result,self._execution_failed(name,result))
         if skill is not None and not self._execution_failed(name, result) and hasattr(self, '_loaded_skill_names'):
             self._loaded_skill_names.add(skill.name)
         if skill_key is not None and not self._execution_failed(name, result):
@@ -1114,13 +1185,48 @@ class Agent:
     def _request_messages(self):
         research = getattr(self, '_research', None)
         context = research.context() if research is not None else ''
+        messages=self.messages
+        if self._plan is not None and self._plan.data['strict']:
+            # 小任务之间隔离长工具历史；同一步内保留完整 tool_calls/tool 组。
+            current=self._plan.current()
+            step_id=current['id'] if current else '__completed__'
+            if getattr(self,'_context_step_id',None)!=(self._plan.data['id'],step_id):
+                self._context_step_id=(self._plan.data['id'],step_id)
+                self._context_marker=self.messages[-1] if self.messages else None
+            marker=getattr(self,'_context_marker',None)
+            position=next((i for i,m in enumerate(self.messages) if m is marker),None)
+            tail=self.messages[position+1:] if position is not None else self.messages[2:]
+            messages=[self.messages[0],{'role':'user','content':f'工作区：{self.workspace.root}\n当前完整目标：{self._task}'}]+tail
+            context=''
         if research is not None and research.document:
-            context = ('Word 生成方式：直接调用 write_file，path 使用 .docx，content 填完整正文；'
+            context = (('复杂 Word 文档先按当前小任务写详细分析笔记，再调用 assemble_document 汇总，最后逐项检查覆盖范围。\n'
+                        if self._plan is not None and self._plan.data['strict'] else '')
+                       + 'Word 格式支持：调用 write_file，path 使用 .docx，content 填完整正文；'
                        'Agent 会自动生成真正的 DOCX 并检查包结构。无需 shell、Python 脚本、'
                        'python-docx 或安装依赖。先据已有证据产出，不要反复只说准备生成。\n' + context)
+        if self._plan is not None:
+            context += '\n\n' + self._plan.context()
+        if getattr(self,'_manual_skill_rules',''):
+            context += '\n\n用户手动加载的技能规范：\n'+self._manual_skill_rules[:12000]
         if not context:
-            return self.messages
-        return self.messages + [{'role': 'user', 'content': context}]
+            return messages
+        return messages + [{'role': 'user', 'content': context}]
+
+    def select_skill(self, name):
+        from core.skills import discover, find
+        skill=find(discover(self._config(),self.workspace),name)
+        if not skill:
+            raise ValueError('未找到技能：'+name)
+        names=self._session_memory.setdefault('selected_skills',[])
+        if skill.name not in names:
+            names.append(skill.name)
+        return skill.name
+
+    def _finish_plan(self):
+        if self._plan is not None and not self._plan.data['strict']:
+            for step in self._plan.data['steps']:
+                step['status']='completed'
+            self._plan.save()
 
     @staticmethod
     def _skill_cache_key(skill):

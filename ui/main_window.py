@@ -31,6 +31,8 @@ from core.workspace import Workspace, WorkspaceError
 from ui.theme import THEMES, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, build_qss
 from ui.workers import AgentWorker, FetchModelsWorker
 from ui.icons import line_icon
+from core.branding import APP_NAME, WINDOW_TITLE
+from ui.markdown_document import MarkdownPanel, readable_markdown
 
 log = get_logger("ui.main_window")
 
@@ -122,6 +124,7 @@ class MarkdownView(AutoHeightLabel):
         self.setDocument(MarkdownDocument(self))
         self.document().documentLayout().documentSizeChanged.connect(self._sync_height)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.source = ""
         self.source_mode = False
@@ -184,6 +187,20 @@ class MarkdownView(AutoHeightLabel):
             url = QUrl(link)
             if url.scheme().lower() in ("http", "https", "mailto"):
                 QDesktopServices.openUrl(url)
+
+    def wheelEvent(self,event):
+        if event.modifiers() & Qt.ShiftModifier:
+            return super().wheelEvent(event)
+        parent=self.parentWidget()
+        while parent is not None:
+            if isinstance(parent,QScrollArea):
+                bar=parent.verticalScrollBar()
+                delta=event.pixelDelta().y() or event.angleDelta().y()*bar.singleStep()*3/120
+                bar.setValue(bar.value()-int(delta))
+                event.accept()
+                return
+            parent=parent.parentWidget()
+        event.ignore()
 
 
 class InputBox(QPlainTextEdit):
@@ -453,6 +470,10 @@ class ToolCollapseCard(QFrame):
         self._spin = (self._spin + 1) % 4
         self._refresh_head()
 
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if hasattr(self,'head'): self._refresh_head()
+
     def _refresh_head(self):
         self.head.setArrowType(Qt.DownArrow if self.head.isChecked() else Qt.RightArrow)
         self.head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -461,10 +482,12 @@ class ToolCollapseCard(QFrame):
             status = {"done": "已完成", "error": "执行失败", "cancelled": "已停止"}[self._outcome]
             suffix = f" {status} · {n} 项操作"
         else:
-            dots = "." * self._spin
-            suffix = f" 正在执行{dots}"
+            suffix = f" 执行中 · {n} 项操作"
         status = f" {self._status_msg}" if self._status_msg else ""
-        self.head.setText(f"{suffix.strip()}{status}")
+        full=f"{suffix.strip()}{status}"
+        self.head.setToolTip(full)
+        self.head.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
+        self.head.setText(self.head.fontMetrics().elidedText(full,Qt.ElideRight,max(180,self.width()-50)))
 
     def _on_toggle(self, checked):
         self.body.setVisible(bool(checked))
@@ -481,8 +504,9 @@ class ToolCollapseCard(QFrame):
     def _body_line(self, text: str):
         # V31.2：用 AutoHeightLabel（高度随文档自适应，封顶 260px + 内部滚动）
         # 旧的 setFixedHeight(document().size().height()) 在控件未布局时算到 0
-        lab = AutoHeightLabel(str(text), self.body, objname="toolProgress",
-                              max_height=260)
+        lab = MarkdownView(self._c,parent=self.body)
+        lab.setObjectName('toolProgress')
+        lab.set_source(readable_markdown(str(text)))
         self.body_v.addWidget(lab)
         self._lines += 1
         return lab
@@ -498,23 +522,45 @@ class ToolCollapseCard(QFrame):
     def add_action(self, name, arguments):
         labels = {"read_file": "读取文件", "write_file": "写入文件", "append_file": "追加文本",
                   "list_files": "查看目录", "search_files": "搜索内容", "run_python": "运行 Python",
-                  "run_command": "执行命令", "web_collect": "采集网页", "tcp_echo_test": "TCP 联调"}
+                  "run_command": "执行命令", "web_collect": "采集网页", "tcp_echo_test": "TCP 联调",
+                  "set_plan":"制定计划","update_task":"验收子任务","task_status":"检查进度","assemble_document":"汇总文档"}
         args_dict = dict(arguments or {})
         self._actions += 1
         self._status_msg = labels.get(name, name)
         if "content" in args_dict and isinstance(args_dict["content"], str):
             args_dict["content"] = f"（正文 {len(args_dict['content'])} 字符）"
-        args = json.dumps(args_dict, ensure_ascii=False)
-        if len(args) > 300:
-            args = args[:300] + "  …(已截断)"
-        self._body_line(f"{labels.get(name, name)}\n{args}").setObjectName("toolAction")
+        self._last_action_name=name
+        self._last_action_path=str(args_dict.get('path') or '')
+        parts=[]
+        for key,value in args_dict.items():
+            label={'path':'文件','pattern':'关键词','command':'命令','content':'内容','id':'任务','status':'状态'}.get(key,key)
+            text=str(value)
+            parts.append(f'{label}：'+(text[:220]+'…' if len(text)>220 else text))
+        self._body_line(f"**{labels.get(name, name)}**\n\n"+'  \n'.join(parts)).setObjectName("toolAction")
         self._refresh_head()
 
     def add_observation(self, content):
         text = str(content or "")
         if len(text) > 6000:
             text = text[:3000] + "\n…（中间已省略）…\n" + text[-3000:]
-        self._body_line(f"  {text}").setObjectName("toolObs")
+        toggle=QToolButton(self.body)
+        toggle.setObjectName('resultToggle')
+        toggle.setCheckable(True)
+        toggle.setArrowType(Qt.RightArrow)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setText(f'查看结果 · {len(text.splitlines()) or 1} 行')
+        self.body_v.addWidget(toggle)
+        if (getattr(self,'_last_action_name','')=='read_file'
+                and Path(getattr(self,'_last_action_path','')).suffix.lower() in ('.py','.c','.h','.cpp','.js','.ts','.json')):
+            text='````\n'+text+'\n````'
+        view=self._body_line(text)
+        view.setObjectName('toolObs')
+        view.hide()
+        def expand(checked):
+            view.setVisible(checked)
+            toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            view._sync_height()
+        toggle.toggled.connect(expand)
         self._refresh_head()
 
 
@@ -575,8 +621,9 @@ class DebugCard(QFrame):
                 "参数：" + json.dumps(args, ensure_ascii=False), "debugMeta"))
 
         bv.addWidget(self._label("模型原始返回（可选中复制）：", "debugMeta"))
-        raw_view = SelectableLabel(str(raw or ""), self.body, objname="debugRaw")
-        raw_view.setFixedHeight(180)
+        raw_view = MarkdownView(colors,parent=self.body)
+        raw_view.setObjectName('debugRaw')
+        raw_view.set_source(readable_markdown(str(raw or '')))
         raw_view.setLineWrapMode(QTextEdit.WidgetWidth)
         bv.addWidget(raw_view)
 
@@ -632,12 +679,12 @@ class MainWindow(QMainWindow):
 
         self.confirm_signal.connect(self._on_confirm_dialog)
 
-        self.setWindowTitle("PyAgent Studio")
+        self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumSize(920, 680)
         self._icon_buttons = []
         self.resize(int(1200 * min(self.ui_scale, 1.4)),
                     int(820 * min(self.ui_scale, 1.4)))
-        icon_path = RESOURCE_ROOT / "icons" / "app.png"
+        icon_path = RESOURCE_ROOT / "icons" / "zhixing.svg"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -670,22 +717,22 @@ class MainWindow(QMainWindow):
         side = QWidget(self)
         side.setObjectName("sidebar")
         self.sidebar = side
-        side.setFixedWidth(self._px(272))
+        side.setFixedWidth(self._px(296))
         v = QVBoxLayout(side)
         v.setContentsMargins(18, 24, 18, 18)
         v.setSpacing(14)
 
         logo_row = QHBoxLayout()
         logo_row.setSpacing(8)
-        badge = QLabel("P", side)
+        badge = QLabel("知", side)
         badge.setObjectName("brandBadge")
         badge.setFixedSize(self._px(38), self._px(38))
         badge.setAlignment(Qt.AlignCenter)
         name_box = QVBoxLayout()
         name_box.setSpacing(0)
-        name = QLabel("PyAgent", side)
+        name = QLabel(APP_NAME, side)
         name.setObjectName("logoName")
-        sub = QLabel("S T U D I O", side)
+        sub = QLabel("思考 · 规划 · 行动", side)
         sub.setObjectName("logoSub")
         name_box.addWidget(name)
         name_box.addWidget(sub)
@@ -693,6 +740,12 @@ class MainWindow(QMainWindow):
         logo_row.addLayout(name_box)
         logo_row.addStretch(1)
         v.addLayout(logo_row)
+
+        self.workspace_button = QPushButton("选择工作区  ↗", side)
+        self.workspace_button.setObjectName("workspaceCard")
+        self.workspace_button.setCursor(Qt.PointingHandCursor)
+        self.workspace_button.clicked.connect(self.mount_workspace)
+        v.addWidget(self.workspace_button)
 
         self.b_new = QPushButton("＋   新建会话", side)
         self.b_new.setShortcut(QKeySequence("Alt+K"))
@@ -712,8 +765,8 @@ class MainWindow(QMainWindow):
 
         tab_row = QHBoxLayout()
         tab_row.setSpacing(6)
-        self.tab_chat = QPushButton("对话", side)
-        self.tab_ws = QPushButton("工作台", side)
+        self.tab_chat = QPushButton("历史对话", side)
+        self.tab_ws = QPushButton("工作区", side)
         for i, b in enumerate((self.tab_chat, self.tab_ws)):
             b.setObjectName("sideTab")
             b.setCheckable(True)
@@ -750,9 +803,17 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.header().setStretchLastSection(False)
         self.tree.setColumnWidth(1, self._px(30))
         self.tree.setIndentation(self._px(12))
         self.tree.setRootIsDecorated(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setIndentation(0)
+        self.tree.setMouseTracking(True)
+        from ui.navigation import SessionDelegate
+        self.tree.setItemDelegate(SessionDelegate(self,self.tree))
+        self.tree.itemClicked.connect(lambda item,col: self._on_tree_double(item,col)
+                                     if (item.data(0,Qt.UserRole) or ('',))[0]=='session' else None)
         self.tree.setExpandsOnDoubleClick(False)
         self.tree.itemDoubleClicked.connect(self._on_tree_double)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -762,15 +823,26 @@ class MainWindow(QMainWindow):
 
         v.addWidget(self.side_stack, 1)
 
-        self.workspace_button = QPushButton("选择工作区  ↗", side)
-        self.workspace_button.setObjectName("workspaceCard")
-        self.workspace_button.setCursor(Qt.PointingHandCursor)
-        self.workspace_button.clicked.connect(self.mount_workspace)
-        v.addWidget(self.workspace_button)
+        skill_row=QHBoxLayout()
+        self.b_skills_load=QPushButton('加载技能',side)
+        self.b_skills_write=QPushButton('编写技能',side)
+        for button in (self.b_skills_load,self.b_skills_write):
+            button.setObjectName('taskAction')
+            button.setCursor(Qt.PointingHandCursor)
+        self.b_skills_load.clicked.connect(lambda: self.open_skills(False))
+        self.b_skills_write.clicked.connect(lambda: self.open_skills(True))
+        skill_row.addWidget(self.b_skills_load)
+        skill_row.addWidget(self.b_skills_write)
+        v.addLayout(skill_row)
+        self.b_task_plan=QPushButton('任务计划与进度',side)
+        self.b_task_plan.setObjectName('taskAction')
+        self.b_task_plan.setCursor(Qt.PointingHandCursor)
+        self.b_task_plan.clicked.connect(self.open_task_plan)
+        v.addWidget(self.b_task_plan)
 
         user_row = QHBoxLayout()
         user_row.setSpacing(8)
-        av = QLabel("P", side)
+        av = QLabel("本", side)
         av.setObjectName("avatar")
         av.setFixedSize(self._px(30), self._px(30))
         av.setAlignment(Qt.AlignCenter)
@@ -778,7 +850,7 @@ class MainWindow(QMainWindow):
         ub.setSpacing(0)
         un = QLabel("本地工作空间", side)
         un.setObjectName("userName")
-        up = QLabel("PyAgent Desktop", side)
+        up = QLabel("知行 · 本地智能助手", side)
         up.setObjectName("userPlan")
         ub.addWidget(un)
         ub.addWidget(up)
@@ -804,12 +876,12 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(4)
-        b_mount = QPushButton("📂 挂载/切换", page)
+        b_mount = QPushButton("切换项目", page)
         b_mount.setObjectName("wsBtn")
         b_mount.setCursor(Qt.PointingHandCursor)
         b_mount.setToolTip("挂载或切换工作区目录")
         b_mount.clicked.connect(self.mount_workspace)
-        b_unmount = QPushButton("⏏ 卸载", page)
+        b_unmount = QPushButton("断开", page)
         b_unmount.setObjectName("wsBtn")
         b_unmount.setCursor(Qt.PointingHandCursor)
         b_unmount.setToolTip("卸载当前工作区")
@@ -818,7 +890,7 @@ class MainWindow(QMainWindow):
         row.addWidget(b_unmount)
         v.addLayout(row)
 
-        b_open = QPushButton("🗖 打开目录", page)
+        b_open = QPushButton("在资源管理器中打开", page)
         b_open.setObjectName("wsBtn")
         b_open.setCursor(Qt.PointingHandCursor)
         b_open.setToolTip("在资源管理器中打开工作区目录")
@@ -826,12 +898,16 @@ class MainWindow(QMainWindow):
             lambda: self._open_path(self.agent.workspace.root
                                     if self.agent.workspace else None))
         v.addWidget(b_open)
+        self._icon_buttons.extend([(b_mount,'folder',False),(b_open,'folder',False)])
 
         self.ws_tree = QTreeWidget(page)
         self.ws_tree.setColumnCount(1)
         self.ws_tree.setHeaderHidden(True)
         self.ws_tree.setIndentation(self._px(12))
+        self.ws_tree.setObjectName('workspaceFiles')
+        self.ws_tree.setMouseTracking(True)
         self.ws_tree.itemDoubleClicked.connect(self._on_ws_tree_double)
+        self.ws_tree.itemExpanded.connect(self._expand_ws_dir)
         v.addWidget(self.ws_tree, 1)
         return page
 
@@ -883,6 +959,11 @@ class MainWindow(QMainWindow):
             self._set_icon(b, {"✚": "plus", "📂": "folder", "🌙": "moon", "⚙": "settings"}[text])
             hv.addWidget(b)
         v.addWidget(header)
+        self.plan_progress=QLabel('任务计划与临时资料保存在工作区 .agent 目录',main)
+        self.plan_progress.setObjectName('taskProgress')
+        self.plan_progress.setContentsMargins(28,2,24,6)
+        self.plan_progress.setWordWrap(True)
+        v.addWidget(self.plan_progress)
 
         # 消息流
         self.scroll = QScrollArea(main)
@@ -915,7 +996,7 @@ class MainWindow(QMainWindow):
 
         self.input = InputBox(card)
         self.input.setObjectName("inputBox")
-        self.input.setPlaceholderText("描述你的任务，让 PyAgent 帮你完成…")
+        self.input.setPlaceholderText("描述目标，让知行帮你规划并执行…")
         self.input.setAccessibleName("任务输入框")
         self.input.setFixedHeight(self._px(64))
         self.input.submitted.connect(self._on_send_clicked)
@@ -990,7 +1071,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
-        mark = QLabel("P", panel)
+        mark = QLabel("知", panel)
         self.welcome_mark = mark
         mark.setObjectName("welcomeMark")
         mark.setFixedSize(56, 56)
@@ -1097,6 +1178,13 @@ class MainWindow(QMainWindow):
         for view in self.findChildren(MarkdownView):
             view.colors, view.scale = colors, self.ui_scale
             view.flush()
+        for view in self.findChildren(MarkdownPanel):
+            view.colors,view.scale=colors,self.ui_scale
+            view.set_markdown(view.source)
+        for label in self.findChildren(QLabel):
+            source=label.property('markdown_source')
+            if source is not None: label.setText(self._label_markdown_html(source,label.objectName()=='errLine'))
+        if hasattr(self,'tree'): self.tree.viewport().update()
 
     def _px(self, n):
         """按当前缩放系数换算像素值"""
@@ -1155,14 +1243,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "b_send"):
             self.b_send.setFixedSize(self._px(40), self._px(36))
         if hasattr(self, "sidebar"):
-            self.sidebar.setFixedWidth(self._px(272))
+            self.sidebar.setFixedWidth(self._px(296))
 
     def _relayout_streams(self):
         """缩放后按新字号重算历史消息块高度"""
         for w in (getattr(self, "_stream_view", None),):
             if w is not None:
                 w._sync_height()          # V31.2：AutoHeightLabel 自带同步方法
-        self._scroll_bottom()
+        if self._near_bottom(): self._scroll_bottom()
 
     def toggle_theme(self):
         self.config.theme = "light" if self.config.theme == "dark" else "dark"
@@ -1180,6 +1268,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, _go)
 
     # ---------- 消息渲染 ----------
+    def _label_markdown_html(self,text,error=False):
+        from ui.markdown_document import MarkdownDocument,render_markdown
+        document=MarkdownDocument()
+        colors=dict(self._c)
+        if error: colors.update(text=self._c['error'],text2=self._c['error'])
+        render_markdown(document,readable_markdown(str(text)),colors,self.ui_scale)
+        return re.sub(r'<img\b[^>]*>','[图片]',document.toHtml(),flags=re.I)
+
     def _add_widget(self, w):
         follow = self._near_bottom()
         self.chat_v.insertWidget(self.chat_v.count() - 1, w)
@@ -1191,14 +1287,16 @@ class MainWindow(QMainWindow):
         return bar.maximum() - bar.value() <= self._px(70)
 
     def _append_sys(self, text):
-        lab = QLabel(str(text), self)
+        lab = QLabel(self._label_markdown_html(text), self)
+        lab.setProperty('markdown_source',str(text))
         lab.setObjectName("sysLine")
         lab.setWordWrap(True)
         lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._add_widget(lab)
 
     def _append_error(self, text):
-        lab = QLabel("✘ " + str(text), self)
+        lab = QLabel(self._label_markdown_html('✘ '+str(text),True), self)
+        lab.setProperty('markdown_source','✘ '+str(text))
         lab.setObjectName("errLine")
         lab.setWordWrap(True)
         lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1210,7 +1308,8 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 2, 0, 2)
         h.addStretch(1)
-        bubble = QLabel(html.escape(str(text)).replace("\n", "<br>"), row)
+        bubble = QLabel(self._label_markdown_html(text), row)
+        bubble.setProperty('markdown_source',str(text))
         bubble.setObjectName("userBubble")
         bubble.setWordWrap(True)
         bubble.setTextFormat(Qt.RichText)
@@ -1239,11 +1338,11 @@ class MainWindow(QMainWindow):
 
         head = QHBoxLayout()
         head.setSpacing(6)
-        av = QLabel("P", row)
+        av = QLabel("知", row)
         av.setObjectName("assistAvatar")
         av.setFixedSize(self._px(26), self._px(26))
         av.setAlignment(Qt.AlignCenter)
-        nm = QLabel("PyAgent", row)
+        nm = QLabel(APP_NAME, row)
         nm.setObjectName("assistName")
         head.addWidget(av)
         head.addWidget(nm)
@@ -1262,14 +1361,7 @@ class MainWindow(QMainWindow):
         copy_button.setText("复制")
         copy_button.setToolTip("复制回答全文；右键正文可复制 Markdown 原文")
         copy_button.clicked.connect(view.copy_text)
-        source_button = QToolButton(row)
-        source_button.setObjectName("messageAction")
-        source_button.setText("原文")
-        source_button.setToolTip("切换 Markdown 原文与排版视图")
-        source_button.setCheckable(True)
-        source_button.toggled.connect(view.show_source)
         head.addWidget(copy_button)
-        head.addWidget(source_button)
         self._stream_view.setPlaceholderText("")
         self._stream_view.setFixedHeight(self._px(24))
         v.addWidget(self._stream_view)
@@ -1310,6 +1402,14 @@ class MainWindow(QMainWindow):
 
     def on_event(self, ev):
         t = ev.get("type")
+        if t in ('plan','skill_loaded'):
+            card=self._ensure_tool_card()
+            card.set_status('任务计划已保存' if t=='plan' else ev.get('content','技能已加载'))
+            card._body_line(ev.get('content',''))
+            self.refresh_plan_progress()
+            return
+        if t in ('action','observation','answer','error','done'):
+            self.refresh_plan_progress()
         self._feed_watchdog()
         if t == "keepalive":                      # 只喂看门狗，不渲染
             if ev.get("phase") and self._tool_card is not None:
@@ -1546,6 +1646,60 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.warning("会话保存失败: %s", e)
 
+    def open_skills(self, edit=False):
+        from ui.skills_dialog import SkillsDialog
+        dialog=SkillsDialog(self,edit=edit)
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.exec_()
+
+    def refresh_plan_progress(self):
+        plan=getattr(self.agent,'_plan',None)
+        if plan is None:
+            return
+        current=plan.current()
+        completed=sum(s['status']=='completed' for s in plan.data['steps'])
+        self.plan_progress.setText(f'任务进度 {completed}/{len(plan.data["steps"])} · '+
+                                   (current['title'] if current else '全部步骤已完成'))
+        self.plan_progress.setToolTip(str(plan.directory))
+
+    def open_task_plan(self):
+        plan=getattr(self.agent,'_plan',None)
+        ws=self.agent.workspace
+        if plan is None and ws:
+            task_id=self.agent.session_memory().get('plan_id')
+            if task_id and re.fullmatch(r'[a-f0-9]{16}',str(task_id)):
+                path=ws.resolve('.agent/tasks/'+task_id+'/plan.json')
+                if path.exists():
+                    from core.task_plan import TaskPlan
+                    try: plan=TaskPlan(ws,json.loads(path.read_text(encoding='utf-8')))
+                    except (OSError,ValueError): pass
+        if plan is None:
+            QMessageBox.information(self,'任务计划','挂载工作区并发送任务后，会自动拆分步骤并保存到 .agent/tasks。')
+            return
+        dialog=QDialog(self)
+        dialog.setWindowTitle('任务计划与当前进度')
+        dialog.resize(850,620)
+        layout=QVBoxLayout(dialog)
+        view=MarkdownPanel(self._c,self.ui_scale,dialog)
+        layout.addWidget(view)
+        location=QLabel(str(plan.directory),dialog)
+        location.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        location.setWordWrap(True)
+        layout.addWidget(location)
+        def refresh():
+            path=plan.directory/'plan.json'
+            try:
+                from core.task_plan import TaskPlan
+                current=TaskPlan(plan.ws,json.loads(path.read_text(encoding='utf-8')))
+                text=current.markdown()
+                if view.source!=text: view.set_markdown(text)
+            except (OSError,ValueError): pass
+        refresh()
+        timer=QTimer(dialog)
+        timer.timeout.connect(refresh)
+        timer.start(1000)
+        dialog.exec_()
+
     def _restore_session(self):
         """启动时恢复最近会话（消息+工作区）；无会话历史则恢复 config.last_workspace"""
         sid = ""
@@ -1653,6 +1807,9 @@ class MainWindow(QMainWindow):
 
     def _open_session_by_id(self, sid):
         """打开指定历史会话（双击 / 回车 / 右键菜单共用）"""
+        if sid==self._session_id:
+            self.input.setFocus()
+            return
         if self._busy:
             QMessageBox.information(self, "提示", "请等待当前任务结束再切换会话。")
             return
@@ -1956,10 +2113,16 @@ class MainWindow(QMainWindow):
             mark = "📌 " if s.get("pinned") else ""
             prefix = "● " if s["id"] == self._session_id else ""
             node.setText(0, f"{mark}{prefix}{s.get('title') or s['id']}")
+            from datetime import datetime
+            stamp=datetime.fromtimestamp(s.get('mtime',0)).strftime('%m月%d日 %H:%M')
+            project=Path(s.get('workspace') or '').name
+            node.setData(0,Qt.UserRole+1,stamp+(' · '+project if project else ' · 本地会话'))
             node.setData(0, Qt.UserRole, ("session", s["id"]))
+            node.setSizeHint(0,QSize(self._px(190),self._px(62)))
             node.setToolTip(0, "\n双击切换会话 · 右键置顶/删除 · 点右侧 ✕ 删除")
-            btn = QPushButton("✕", self.tree)
+            btn = QPushButton("×", self.tree)
             btn.setObjectName("delSessBtn")
+            btn.setStyleSheet('background: transparent; border: none;')
             btn.setFixedSize(self._px(20), self._px(20))
             btn.setCursor(Qt.PointingHandCursor)
             btn.setToolTip("删除该会话（对话与历史记录一并删除，不可恢复）")
@@ -1967,43 +2130,12 @@ class MainWindow(QMainWindow):
                 lambda _=False, sid=s["id"], t=s.get("title", ""):
                 self._delete_session(sid, t))
             self.tree.setItemWidget(node, 1, btn)
+            if s['id']==self._session_id: self.tree.setCurrentItem(node)
         if not shown:
             empty = QTreeWidgetItem(root)
             empty.setText(0, (f"无匹配「{q}」的会话" if q else "（暂无会话）"))
             empty.setData(0, Qt.UserRole, ("none", ""))
 
-        # 工作区节点（文件树）
-        ws = self.agent.workspace
-        if ws is not None:
-            ws_node = QTreeWidgetItem(self.tree)
-            ws_node.setText(0, f"📁 {ws.root.name}")
-            ws_node.setData(0, Qt.UserRole, ("workspace", str(ws.root)))
-            ws_node.setToolTip(0, "双击在资源管理器中打开")
-            ws_node.setExpanded(True)
-            try:
-                entries = sorted(ws.root.iterdir(),
-                                 key=lambda p: (p.is_file(), p.name.lower()))
-            except OSError:
-                entries = []
-            for p in entries[:50]:
-                child = QTreeWidgetItem(ws_node)
-                icon = "📁" if p.is_dir() else "📄"
-                child.setText(0, f"{icon} {p.name}")
-                child.setData(0, Qt.UserRole, ("path", str(p)))
-                child.setToolTip(0, "双击用默认应用打开")
-            if len(entries) > 50:
-                more = QTreeWidgetItem(ws_node)
-                more.setText(0, f"… 其余 {len(entries) - 50} 项")
-                more.setData(0, Qt.UserRole, ("none", ""))
-
-        # 当前会话节点
-        cur = QTreeWidgetItem(self.tree)
-        rounds = sum(1 for m in self.agent.messages
-                     if m.get("role") == "user"
-                     and not str(m.get("content") or "").startswith("OBSERVATION"))
-        cur.setText(0, f"当前会话 · {rounds} 轮" if rounds else "当前会话")
-        cur.setData(0, Qt.UserRole, ("current", ""))
-        cur.setToolTip(0, "双击聚焦输入框")
         self._update_chip_counts()
 
     def _set_session_filter(self, mode):
@@ -2072,21 +2204,40 @@ class MainWindow(QMainWindow):
             node.setData(0, Qt.UserRole, ("none", ""))
             return
         node = QTreeWidgetItem(self.ws_tree)
-        node.setText(0, f"📁 {ws.root.name}")
+        node.setText(0, ws.root.name)
+        node.setIcon(0,line_icon('folder',self._c['accent']))
         node.setData(0, Qt.UserRole, ("workspace", str(ws.root)))
         node.setToolTip(0, "双击在资源管理器中打开")
         node.setExpanded(True)
         try:
-            entries = sorted(ws.root.iterdir(),
+            entries = sorted((p for p in ws.root.iterdir() if p.name!='.agent'),
                              key=lambda p: (p.is_file(), p.name.lower()))
         except OSError:
             entries = []
         for p in entries[:200]:
             child = QTreeWidgetItem(node)
-            icon = "📁" if p.is_dir() else "📄"
-            child.setText(0, f"{icon} {p.name}")
+            child.setText(0, p.name)
+            child.setIcon(0,line_icon('folder' if p.is_dir() else 'file',self._c['text3']))
             child.setData(0, Qt.UserRole, ("path", str(p)))
             child.setToolTip(0, "双击用默认应用打开")
+            if p.is_dir(): child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+
+    def _expand_ws_dir(self,item):
+        data=item.data(0,Qt.UserRole)
+        if not data or data[0]!='path' or item.childCount() or self.agent.workspace is None:
+            return
+        try:
+            directory=self.agent.workspace.resolve(data[1],must_exist=True)
+            if not directory.is_dir(): return
+            entries=sorted((p for p in directory.iterdir() if p.name!='.agent'),key=lambda p:(p.is_file(),p.name.lower()))
+            for path in entries[:200]:
+                self.agent.workspace.resolve(str(path),must_exist=True)
+                child=QTreeWidgetItem(item);child.setText(0,path.name)
+                child.setIcon(0,line_icon('folder' if path.is_dir() else 'file',self._c['text3']))
+                child.setData(0,Qt.UserRole,('path',str(path)))
+                if path.is_dir(): child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        except (OSError,WorkspaceError):
+            item.setToolTip(0,'目录暂时无法访问')
 
     def _on_ws_tree_double(self, item, _col):
         data = item.data(0, Qt.UserRole)
@@ -2103,6 +2254,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "尚未挂载工作区。")
             return
         path = Path(p)
+        if path.is_file() and path.suffix.lower() in ('.md','.markdown'):
+            dialog=QDialog(self); dialog.setWindowTitle(path.name); dialog.resize(900,680)
+            layout=QVBoxLayout(dialog); view=MarkdownPanel(self._c,self.ui_scale,dialog)
+            try: view.set_markdown(path.read_text(encoding='utf-8-sig'))
+            except (OSError,UnicodeError) as exc:
+                QMessageBox.warning(self,'无法读取文档',str(exc)); return
+            layout.addWidget(view); dialog.exec_(); return
         if not path.exists():
             QMessageBox.warning(self, "提示", f"路径不存在: {path}")
             return

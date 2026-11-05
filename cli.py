@@ -10,7 +10,7 @@ from core.workspace import Workspace, WorkspaceError
 
 BANNER = """
 ========================================
-  PyAgent · 工作区智能助手（控制台模式）
+  知行 · 工作区智能助手（控制台模式）
   命令: /mount <路径>  /unmount  /reset
         /tools  /skills  /key <API_KEY>
         /models（拉取模型列表） /model <名称>

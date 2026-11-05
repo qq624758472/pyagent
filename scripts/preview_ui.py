@@ -73,6 +73,30 @@ def main():
         win._clear_chat()
         win.resize(920, 680)
         capture("studio-compact.png")
+        from ui.skills_dialog import SkillsDialog
+        editor=SkillsDialog(win,edit=True)
+        editor.show()
+        for _ in range(8): app.processEvents()
+        editor.grab().save(str(output/'studio-skills.png'))
+        editor.hide()
+        from core.workspace import Workspace
+        from PyQt5.QtWidgets import QToolButton
+        project=Path(directory)/'示例项目'
+        project.mkdir()
+        (project/'README.md').write_text('# 项目说明\n\n用于界面预览的临时项目。',encoding='utf-8')
+        (project/'src').mkdir()
+        sessions.save_session('nav-demo-1',[{'role':'user','content':'梳理模块并补充设计文档'}],str(project),'梳理模块并补充设计文档')
+        sessions.save_session('nav-demo-2',[{'role':'user','content':'检查接口和测试结果'}],str(project),'检查接口和测试结果')
+        win.agent.set_workspace(Workspace(project));win._session_id='nav-demo-1'
+        win.config.theme='light';win.resize(1200,820);win._apply_theme()
+        win._refresh_tree();win._refresh_workbench();win._refresh_status();win._clear_chat()
+        win._append_user('## 检查项目\n\n请先阅读说明，再检查接口和测试结果。')
+        card=win._ensure_tool_card();card.add_action('read_file',{'path':'README.md'})
+        card.add_observation('## 项目检查\n\n| 检查项 | 状态 |\n| --- | --- |\n| 项目说明 | 已读取 |\n| 接口测试 | 进行中 |\n\n已收集模块说明，正在核对接口。')
+        card.head.setChecked(True);card._on_toggle(True)
+        card.findChild(QToolButton,'resultToggle').setChecked(True)
+        win.plan_progress.setText('任务进度 2/6 · 检查接口与测试结果')
+        capture('studio-execution.png')
         # Do not close through MainWindow.closeEvent (which persists sessions).
         win.hide()
     print(f"Previews: {output}")

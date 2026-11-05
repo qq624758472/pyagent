@@ -257,6 +257,18 @@ def build_qss(c, s=1.0):
     }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+    QScrollBar:horizontal {{ background: transparent; height: {f(8)}px; margin: 0; }}
+    QScrollBar::handle:horizontal {{ background: {c['scrollbar']}; min-width: {f(32)}px; border-radius: {f(4)}px; }}
+    QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{ background: {c['text3']}; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+    QFrame#toolCard {{ border: 1px solid {c['border']}; border-radius: {f(10)}px; background: transparent; }}
+    QToolButton#toolToggle {{ font-size: {f(12)}px; padding: {f(7)}px {f(5)}px; color: {c['text2']}; }}
+    QToolButton#resultToggle {{ background: transparent; border: none; color: {c['text3']};
+        text-align: left; padding: {f(6)}px {f(12)}px; font-size: {f(11)}px; }}
+    QToolButton#resultToggle:hover {{ color: {c['accent']}; }}
+    QTextEdit#toolAction, QTextEdit#toolObs, QTextEdit#toolProgress {{ background: transparent; border: none; padding: {f(4)}px {f(8)}px; }}
+    QTextBrowser#markdownPanel {{ background: {c['surface']}; color: {c['text']}; border: none; padding: {f(14)}px; }}
+    QTreeWidget#workspaceFiles::item {{ padding: {f(9)}px {f(4)}px; }}
     /* ---------- Studio 产品组件 ---------- */
     QPushButton {{ outline: none; }}
     QPushButton:focus, QToolButton:focus {{ border: 1px solid {c['accent']}; }}
@@ -288,6 +300,17 @@ def build_qss(c, s=1.0):
         border-radius: {f(10)}px; padding: {f(14)}px {f(10)}px;
         color: {c['text2']}; text-align: left; font-size: {f(12)}px; }}
     #workspaceCard:hover {{ border-color: {c['accent']}; color: {c['text']}; }}
+    QPushButton#taskAction {{ background: {c['elevated']}; color: {c['text2']};
+        border: 1px solid {c['border']}; border-radius: {f(7)}px;
+        padding: {f(7)}px {f(8)}px; font-size: {f(12)}px; }}
+    QPushButton#taskAction:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
+    QLabel#taskProgress {{ color: {c['text2']}; font-size: {f(12)}px; background: transparent; }}
+    QTextEdit#skillBody, QPlainTextEdit#skillBody, QPlainTextEdit#planView, QListWidget#skillList {{
+        background: {c['input_bg']}; color: {c['text']}; border: 1px solid {c['border']};
+        border-radius: {f(7)}px; font-size: {f(13)}px; padding: {f(8)}px;
+        selection-background-color: {c['accent']}; selection-color: {c['accent_text']}; }}
+    QListWidget#skillList::item {{ padding: {f(6)}px; }}
+    QListWidget#skillList::item:selected {{ background: {c['avatar_bg']}; color: {c['text']}; }}
     #chatTitle {{ font-size: {f(16)}px; }}
     #chatSub {{ color: {c['text3']}; padding-top: {f(4)}px; }}
     #stateBadge {{ background: {c['avatar_bg']}; color: {c['avatar_fg']};

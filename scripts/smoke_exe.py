@@ -74,6 +74,8 @@ def inside():
     win.show()
     app.processEvents()
     assert not win.windowIcon().isNull()
+    assert '知行' in win.windowTitle()
+    assert hasattr(win,'_expand_ws_dir')
     assert win.content_stack.currentIndex() == 1  # restores the isolated session
     win.new_chat()
     assert win.content_stack.currentIndex() == 0
@@ -134,6 +136,31 @@ def inside():
     research.drafting = True
     assert '本阶段暂不继续读取' in research.context()
     assert ResearchState('编写 Word 技术方案', research.snapshot()).drafting
+    from core.task_plan import TaskPlan,tool_specs
+    planned=workspace/'plan-case'
+    planned.mkdir(exist_ok=True)
+    planned_ws=Workspace(planned)
+    for i in range(4): planned_ws.write_file(f'module{i}.c',f'int module{i}(void) {{ return {i}; }}')
+    task_plan=TaskPlan.start(planned_ws,'读取源码并编写详细方案 report.docx',True)
+    assert task_plan.data['strict'] and len(task_plan.data['steps'])==8
+    assert (task_plan.directory/'plan.json').is_file()
+    assert {'set_plan','update_task','task_status','assemble_document'}=={s['function']['name'] for s in tool_specs()}
+    win.agent.set_workspace(planned_ws)
+    win.agent._plan=task_plan
+    win.refresh_plan_progress()
+    assert '0/8' in win.plan_progress.text() and win.b_task_plan.text()=='任务计划与进度'
+    from ui.skills_dialog import SkillsDialog
+    skill_editor=SkillsDialog(win,edit=True)
+    skill_editor.name.setText('smoke-design')
+    skill_editor.description.setText('test design skill')
+    skill_editor.body.setPlainText('## Steps\n\nRead source files and write detailed evidence notes before validation.\n')
+    skill_name,skill_path=skill_editor.write_skill()
+    assert skill_path.is_file() and '.agent' in skill_path.parts
+    assert '## Steps' not in skill_editor.body.toPlainText()
+    assert win.agent.select_skill(skill_name)==skill_name
+    from core.skills import skill_roots
+    assert skill_roots(cfg,planned_ws)[-1]==(planned_ws.root/'.agent/skills','workspace')
+    skill_editor.hide()
     win.toggle_theme()
     assert cfg.theme == "light"
     win.hide()
@@ -142,15 +169,15 @@ def inside():
                                  "no console", "bundled Python stdout/stderr",
                                  "background process output", "script errors",
                                  "sessions", "Qt GUI", "theme", "valid Word generation", "streaming Markdown tables",
-                                 "network wait heartbeat", "skill tool-name alias", "model network settings", "session continuity", "interrupted stream recovery", "research stage persistence"]}))
+                                 "network wait heartbeat", "skill tool-name alias", "model network settings", "session continuity", "interrupted stream recovery", "research stage persistence", "persistent subtask plan", "skill editor and selection", "Zhixing branding", "visual Markdown editor"]}))
 
 
 def main():
     root = Path(__file__).resolve().parent.parent
     target = root / "build" / "exe smoke"
     target.mkdir(parents=True, exist_ok=True)
-    exe = target / "PyAgent.exe"
-    shutil.copy2(root / "dist" / "PyAgent.exe", exe)
+    exe = target / "Zhixing.exe"
+    shutil.copy2(root / "dist" / "Zhixing.exe", exe)
     import pefile
     with pefile.PE(str(exe), fast_load=True) as pe:
         assert pe.OPTIONAL_HEADER.Subsystem == 2, "EXE must use Windows GUI subsystem"

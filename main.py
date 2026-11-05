@@ -40,7 +40,7 @@ def gui_available() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PyAgent - 可挂载工作区的智能助手（GUI/控制台双模式）")
+        description="知行 - 可挂载工作区的智能助手（GUI/控制台双模式）")
     parser.add_argument("-c", "--console", action="store_true", help="使用控制台模式")
     parser.add_argument("--gui", action="store_true", help="强制使用图形界面")
     parser.add_argument("-w", "--workspace", metavar="PATH", help="启动时挂载的工作区目录")

@@ -26,6 +26,7 @@ SUITES = [
     ("test_autonomous_loop.py", False),      # 小模型自主编码：失败去重/测试闭环
     ("test_progress_loop.py", False),        # 超过8轮继续修复/双协议验收/无进展识别
     ("test_research_progress.py", False),    # 重复分页读取/资料记录/文档阶段推进/搜索范围
+    ("test_task_planning.py", True),         # 串行子任务/证据门禁/计划续做/技能编写加载
     ("test_word_documents.py", False),       # 真正DOCX生成/结构检查/防止伪文档交付
     ("test_tcp_execution.py", False),       # TCP 服务器生命周期/客户端联调/完成门禁
     ("test_confirm_flow.py", True),        # 高危操作确认：迟到点击拒绝/正常放行
@@ -36,6 +37,7 @@ SUITES = [
     ("test_session_resume.py", True),       # 完整工具历史/交接记录/重启续做/旧格式迁移
     ("test_ui_features.py", True),          # 界面功能补全（离屏 Qt）
     ("test_markdown_ui.py", True),          # Markdown流式/表格/嵌套列表/去重/滚动/状态
+    ("test_ui_redesign.py", True),          # 全局Markdown/可视化技能/导航分区/单一滚动
     ("test_request_lifecycle.py", True),    # 慢SSE心跳/及时取消/真实超时/看门狗/检查点
     ("test_network_settings.py", True),     # 网络超时设置/代理隔离/缩短历史安全重试
     ("test_stream_recovery.py", True),      # 响应中途断开/丢弃残片/自动续做/不重复写入

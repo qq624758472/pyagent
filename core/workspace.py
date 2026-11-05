@@ -56,6 +56,8 @@ class Workspace:
     def list_files(self, path=".", recursive=False) -> str:
         base = self.resolve(path, must_exist=True)
         items = base.rglob("*") if recursive else base.iterdir()
+        if '.agent' not in base.relative_to(self.root).parts:
+            items=(p for p in items if '.agent' not in p.relative_to(self.root).parts)
         lines = []
         for p in sorted(items)[:500]:
             rel = p.relative_to(self.root)
@@ -176,7 +178,8 @@ class Workspace:
         base = self.resolve(path or ".", must_exist=True)
         hits = [] if content or regex else [str(p.relative_to(self.root))
                 for p in (base.rglob(pat) if base.is_dir() else [base])
-                if p.is_file() and (base.is_dir() or p.match(pat))]
+                if p.is_file() and (base.is_dir() or p.match(pat))
+                and ('.agent' in base.relative_to(self.root).parts or '.agent' not in p.relative_to(self.root).parts)]
         if hits:
             return "\n".join(hits[:200])
         has_glob = any(c in pat for c in "*?[")
@@ -198,6 +201,8 @@ class Workspace:
             return f'错误: 无效正则表达式: {exc}。请修正或设置 regex=false 使用普通关键词。'
         out, scanned = [], 0
         for p in (sorted(base.rglob("*")) if base.is_dir() else [base]):
+            if '.agent' in p.relative_to(self.root).parts and '.agent' not in base.relative_to(self.root).parts:
+                continue
             if not p.is_file() or p.suffix.lower() not in _TEXT_EXT:
                 continue
             try:
