@@ -91,12 +91,14 @@ def inside():
     from core.llm_client import LLMClient
     request_client = LLMClient(Config(api_key="smoke"))
     request_client.REASONING_BEAT = 0.01
-    def slow_request(payload, desc, timeout=None, cancelled=None):
+    def slow_request(payload, desc, timeout=None, cancelled=None, protected=()):
         time.sleep(0.15)
         if not cancelled.is_set():
             yield "content", "NETWORK_PUMP_OK"
     request_client._read_sse = slow_request
+    request_client._detect_context_window = lambda model: (4096, 'smoke model metadata')
     network_events = list(request_client.chat_turn([{"role": "user", "content": "test"}]))
+    assert request_client.context_budget().input_limit == 2816
     assert any(event["type"] == "keepalive" for event in network_events)
     assert any(event.get("text") == "NETWORK_PUMP_OK" for event in network_events)
     from ui.main_window import SettingsDialog

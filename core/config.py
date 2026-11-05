@@ -28,7 +28,8 @@ PROFILE_KEYS = ("main", "kb", "web")
 
 # 手改 config.json 时常把 true 写成 "true"、2.5 写成 "2.5"——按字段类型归一
 _NUMERIC_FIELDS = {"temperature": float, "max_iterations": int,
-                   "web_timeout": int, "ui_scale": float, "llm_read_timeout": int}
+                   "web_timeout": int, "ui_scale": float, "llm_read_timeout": int,
+                   "llm_context_limit": int}
 _BOOL_FIELDS = {"allow_shell", "python_enabled", "web_enabled",
                 "debug_mode", "confirm_dangerous", "skills_enabled", "llm_use_system_proxy"}
 
@@ -64,6 +65,7 @@ class Config:
     screen_model: str = ""       # [兼容字段] 迁移时转入 profiles.web.model
     temperature: float = 0.7
     llm_read_timeout: int = 300      # 模型单次读取等待秒数，实际设置限制30~1800
+    llm_context_limit: int = 0       # 0 自动查询；其他值限制使用的上下文 token 数
     llm_use_system_proxy: bool = True  # 保持系统路由；可在设置中为模型接口单独选择直连
     max_iterations: int = 8       # 进度检查间隔；不限制总轮数，无进展预算至少16轮
     allow_shell: bool = False

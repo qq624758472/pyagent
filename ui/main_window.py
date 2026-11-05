@@ -267,6 +267,12 @@ class SettingsDialog(QDialog):
         network_row.addWidget(self.e_llm_timeout)
         network_row.addWidget(self.c_llm_proxy)
         form.addRow("模型等待与连接:", network_row)
+        self.e_context_limit = QSpinBox()
+        self.e_context_limit.setRange(0, 10_000_000)
+        self.e_context_limit.setSpecialValueText('自动查询')
+        self.e_context_limit.setValue(getattr(config, 'llm_context_limit', 0))
+        self.e_context_limit.setToolTip('自动查询模型窗口。手动填写时限制知行使用的容量，最小 512 token。')
+        form.addRow('上下文上限', self.e_context_limit)
 
         # 角色独立配置：kb（知识库检索）/ web（联网采集）
         self.profile_widgets = {}
@@ -409,6 +415,7 @@ class SettingsDialog(QDialog):
             "base_url": self.e_url.text().strip(),
             "model": self.c_model.currentText().strip(),
             "llm_read_timeout": self.e_llm_timeout.value(),
+            "llm_context_limit": max(512, self.e_context_limit.value()) if self.e_context_limit.value() else 0,
             "llm_use_system_proxy": bool(self.c_llm_proxy.currentData()),
             "profiles": {k: w.currentText().strip()
                          for k, w in self.profile_widgets.items()},
@@ -2014,6 +2021,7 @@ class MainWindow(QMainWindow):
         self.config.base_url = v["base_url"]
         self.config.model = v["model"]
         self.config.llm_read_timeout = v.get('llm_read_timeout', self.config.llm_read_timeout)
+        self.config.llm_context_limit = v['llm_context_limit']
         self.config.llm_use_system_proxy = v.get('llm_use_system_proxy', self.config.llm_use_system_proxy)
         for key, model in (v.get("profiles") or {}).items():
             p = self.config.profile(key)

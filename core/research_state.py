@@ -30,7 +30,7 @@ class ResearchState:
         except (OSError, ValueError):
             version = ''
         lines = [line.strip() for line in result.splitlines() if line.strip()
-                 and not line.startswith(('(文件共', '[内容搜索]', '...(中间', '...(命中'))]
+                 and not line.startswith(('(文件共', '下一页：', '[内容搜索]', '...(中间', '...(命中'))]
         # 搜索结果自带文件位置，不能把查询关键词/路径参数算成新证据。
         prefix = 'search' if name == 'search_files' else name + ':' + target + ':' + version
         evidence = {hashlib.sha256((prefix + ':' + line).encode()).hexdigest() for line in lines}

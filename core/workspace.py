@@ -67,25 +67,32 @@ class Workspace:
                 lines.append(f"[文件 {p.stat().st_size}B] {rel}")
         return "\n".join(lines) or "(空目录)"
 
-    def read_file(self, path, line_start=None, line_end=None) -> str:
+    def read_file(self, path, line_start=None, line_end=None, column_start=None, max_bytes=None) -> str:
         p = self.resolve(path, must_exist=True)
         if p.is_dir():
             raise WorkspaceError(f"'{path}' 是目录，不是文件")
-        if p.suffix.lower() == ".docx":
+        document = p.suffix.lower() == '.docx'
+        if document:
             from core.word_documents import DocumentError, inspect_docx
             try:
-                return "[DOCX 结构校验通过，以下为正文文本]\n" + inspect_docx(p)["text"]
+                text = inspect_docx(p)['text']
             except DocumentError as exc:
                 raise WorkspaceError(str(exc)) from exc
-        if p.stat().st_size > MAX_READ_BYTES:
-            raise WorkspaceError(f"文件过大(>{MAX_READ_BYTES // 1000}KB)，拒绝读取")
-        text = p.read_text(encoding="utf-8", errors="replace")
+        else:
+            if p.stat().st_size > MAX_READ_BYTES:
+                raise WorkspaceError(f"文件过大(>{MAX_READ_BYTES // 1000}KB)，拒绝读取")
+            text = p.read_text(encoding="utf-8", errors="replace")
         if "\x00" in text[:1024]:
             raise WorkspaceError("疑似二进制文件，无法作为文本读取")
         if not text:
             return "(空文件)"
         # 行区间读取（V31.2）：模型常要"看第 900 行附近"，不必整篇拉进来
         start, end = _as_line(line_start), _as_line(line_end)
+        if max_bytes or column_start:
+            page = self._read_page(text, start or 1, end, _as_line(column_start) or 1, max_bytes)
+            return '[DOCX 结构校验通过]\n' + page if document else page
+        if document:
+            return '[DOCX 结构校验通过，以下为正文文本]\n' + text
         if start or end:
             lines = text.splitlines()
             total = len(lines)
@@ -97,6 +104,28 @@ class Workspace:
             head = f"(文件共 {total} 行，显示第 {s}-{e} 行)\n"
             return head + body
         return text
+
+    @staticmethod
+    def _read_page(text, start, end, column, max_bytes):
+        lines = text.splitlines()
+        total = len(lines)
+        end = min(end or total, total)
+        if start > end:
+            return f'(文件共 {total} 行，起始行 {start} 超出范围)'
+        body = '\n'.join([lines[start - 1][column - 1:]] + lines[start:end])
+        if not max_bytes or len(body.encode('utf-8')) <= max_bytes:
+            return f'(文件共 {total} 行，显示第 {start}-{end} 行，起始列 {column})\n{body}'
+        # Prefer full lines. A single long line is continued by character column.
+        page = body.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+        if '\n' in page:
+            page = page.rsplit('\n', 1)[0]
+            next_line, next_column = start + page.count('\n') + 1, 1
+        else:
+            next_line, next_column = start, column + len(page)
+            if next_column > len(lines[start - 1]):
+                next_line, next_column = start + 1, 1
+        return (f'(文件共 {total} 行，本页起始行 {start}，起始列 {column}，请求终止行 {end})\n'
+                f'{page}\n下一页：调用 read_file，line_start={next_line}，column_start={next_column}，line_end={end}。')
 
     def write_file(self, path, content="") -> str:
         p = self.resolve(path)

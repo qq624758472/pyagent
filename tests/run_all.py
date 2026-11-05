@@ -22,6 +22,7 @@ SUITES = [
     ("test_reasoning_fallback.py", False),  # reasoning_content 兜底（文本协议）
     ("test_protocol_nudge.py", False),      # 协议追问闭环（文本协议）
     ("test_native_protocol.py", False),     # 原生 function calling 协议
+    ("test_context_budget.py", False),       # 窗口探测/预算/分页/截断恢复
     ("test_agent_quality.py", False),        # 小模型：历史/工具调用完整性与回退
     ("test_autonomous_loop.py", False),      # 小模型自主编码：失败去重/测试闭环
     ("test_progress_loop.py", False),        # 超过8轮继续修复/双协议验收/无进展识别

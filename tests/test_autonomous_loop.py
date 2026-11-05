@@ -108,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="pyagent_reasoning_recovery_") as tmp:
     check("空回合恢复后可完成真实测试", events[-1]["type"] == "answer")
 
 from core.llm_client import LLMClient
-gpt_cfg = Config(api_key="k", model="fauxpaslife/gpt-oss-20B-Q5_K_M:latest")
+gpt_cfg = Config(model="fauxpaslife/gpt-oss-20B-Q5_K_M:latest")
 gpt_payload = LLMClient(gpt_cfg)._payload([{"role": "user", "content": "hi"}])
 check("gpt-oss 默认低推理预算", gpt_payload["reasoning_effort"] == "low")
 check("gpt-oss 生成 token 有界", gpt_payload["max_tokens"] <= 4096)

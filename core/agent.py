@@ -6,7 +6,7 @@ import time
 from typing import Callable, Iterator, Optional
 
 from core.config import Config
-from core.llm_client import LLMClient, LLMError
+from core.llm_client import LLMClient, LLMError, LLMOutputLimit
 from core.log import get_logger, brief, oneline_json
 from core.tools import execute_tool, openai_tools, tools_description
 from core.workspace import Workspace, WorkspaceError
@@ -200,6 +200,8 @@ class Agent:
             self._idle_rounds = 0
             self._stall_recoveries = 0
             self._stream_recoveries = 0
+            self._output_limit_streak = 0
+            self._task_message = None
             self._loaded_skill_results = {}
             self._loaded_skill_names = set()
             self._last_failure = ""
@@ -237,6 +239,16 @@ class Agent:
                 except (OSError,ValueError) as exc:
                     log.warning('手动选择的技能加载失败: %s', exc)
         self._task = task
+        if not self._reuse_task_on_fallback:
+            self._history_input_limit = None
+            if isinstance(self.llm, LLMClient) and self.llm.api_key:
+                budget = self.llm.context_budget()
+                self._history_input_limit = budget.input_limit
+                yield {'type': 'progress', 'content': f'上下文 {budget.window} token（{budget.source}），'
+                                                       f'输入预算 {budget.input_limit}，输出上限 {budget.output}。'}
+                if should_stop and should_stop():
+                    yield {'type': 'cancelled'}
+                    return
         # V28 协议分流：native = 原生 function calling（gpt-oss 等思考模型
         # 唯一可靠路径）；text = 原有 ACTION/ANSWER 文本协议
         if self._native_mode():
@@ -249,7 +261,8 @@ class Agent:
             # 避免重复追加任务导致小模型把同一请求理解成两个任务。
             self._reuse_task_on_fallback = False
         else:
-            self.messages.append({"role": "user", "content": task + skill_hint + self._resume_context})
+            self._task_message = {"role": "user", "content": task + skill_hint + self._resume_context}
+            self.messages.append(self._task_message)
         self._trim_history()
         used_tools = False          # 本任务是否已成功执行过工具
         redirected = False         # 教程式纠偏只用一次（防循环）
@@ -312,6 +325,9 @@ class Agent:
                 if should_stop and should_stop():
                     yield {"type": "cancelled"}
                     return
+                if self._recover_output_limit(e):
+                    yield {'type': 'redirect', 'discard_partial': True, 'content': '本轮输出达到上限，改为分段执行。'}
+                    continue
                 if self._recover_interrupted_stream(e):
                     yield {"type": "redirect", "discard_partial": True,
                            "content": f"响应中途断开，已丢弃未完成片段，保留已执行结果，自动续做 {self._stream_recoveries}/2"}
@@ -320,6 +336,7 @@ class Agent:
                 yield {"type": "error", "content": str(e)}
                 return
 
+            self._output_limit_streak = 0
             if should_stop and should_stop():
                 if full:
                     self.messages.append({"role": "assistant", "content": full})
@@ -524,8 +541,9 @@ class Agent:
                 "该工具会启动服务端、发送消息、检查客户端，并清理进程。"
                 "若失败，阅读错误、修改代码后重试；测试通过才能宣称完成。"
                 "若需手动逐步调试，使用 start_process/process_status/stop_process 管理服务。")
-        self.messages.append({"role": "user",
-                              "content": f"{ws_hint}\n\n用户任务：{task}{skill_hint}{coding_hint}{self._resume_context}"})
+        self._task_message = {"role": "user",
+                              "content": f"{ws_hint}\n\n用户任务：{task}{skill_hint}{coding_hint}{self._resume_context}"}
+        self.messages.append(self._task_message)
         self._trim_history()
         # Python 小项目只暴露编码所需的少量工具，降低小模型在 13+ 工具间
         # 选择的负担与 Ollama 上下文占用；其他项目仍保留完整工具集。
@@ -558,8 +576,6 @@ class Agent:
         model_recoveries = 0
         reasoning_recoveries = 0
         last_execution_failure = ""
-        if "gpt-oss" in str(getattr(self.llm, "model", "")).lower():
-            self.KEEP_CHARS = min(self.KEEP_CHARS, 5200)
         log.info("原生协议启动: model=%s 工具数=%d",
                  getattr(self.llm, "model", "?"), len(tools))
         # V31：手动计数替代 for-range——空回合重试不消耗迭代配额。
@@ -605,6 +621,9 @@ class Agent:
                 if should_stop and should_stop():
                     yield {"type": "cancelled"}
                     return
+                if self._recover_output_limit(e):
+                    yield {'type': 'redirect', 'discard_partial': True, 'content': '本轮输出达到上限，改为分段执行。'}
+                    continue
                 if self._recover_interrupted_stream(e):
                     yield {"type": "redirect", "discard_partial": True,
                            "content": f"响应中途断开，已丢弃未完成片段，保留已执行结果，自动续做 {self._stream_recoveries}/2"}
@@ -642,6 +661,7 @@ class Agent:
                 yield {"type": "error", "content": str(e)}
                 return
 
+            self._output_limit_streak = 0
             text = "".join(content_parts)
             if text.strip() or tool_calls:
                 empty_streak = 0
@@ -894,6 +914,12 @@ class Agent:
                 pass
         return None
 
+    def _recover_output_limit(self, error):
+        if not isinstance(error, LLMOutputLimit) or self._output_limit_streak >= 3:
+            return False
+        self._output_limit_streak += 1
+        return True
+
     def _recover_interrupted_stream(self, error):
         from core.llm_client import LLMStreamInterrupted
         if not isinstance(error, LLMStreamInterrupted) or self._stream_recoveries >= 2:
@@ -1072,7 +1098,8 @@ class Agent:
                     "请读取错误并实际修改相关代码或配置后再验证。")
         result = execute_tool(name, self.workspace, self._config(),
                               arguments, progress=progress, confirm=confirm,
-                              should_stop=should_stop, approved=approved)
+                              should_stop=should_stop, approved=approved,
+                              read_page_bytes=getattr(self.llm, 'read_page_bytes', None))
         if self._plan is not None:
             self._plan.observe(name,arguments,result,self._execution_failed(name,result))
         if skill is not None and not self._execution_failed(name, result) and hasattr(self, '_loaded_skill_names'):
@@ -1087,7 +1114,10 @@ class Agent:
         log.info("OBSERVATION(%d字, 耗时%.1fs): %s",
                  len(result), time.monotonic() - t0, brief(result, 400))
         result = self._visible_observation(result)
-        if getattr(self, '_research_fresh', None) is False:
+        # A budgeted page may have been omitted or shortened on the previous
+        # request. Allow a fresh read without counting duplicate data as progress.
+        paged_read = name == 'read_file' and getattr(self.llm, 'read_page_bytes', None) is not None
+        if getattr(self, '_research_fresh', None) is False and not paged_read:
             result = ('该资料的可见内容此前已收集，换行号范围不代表新进展。'
                       '请使用已保存的资料记录，读取未覆盖内容或保存分析草稿。')
         # ---------- 执行结果闭环校验（V17） ----------
@@ -1185,7 +1215,9 @@ class Agent:
     def _request_messages(self):
         research = getattr(self, '_research', None)
         context = research.context() if research is not None else ''
-        messages=self.messages
+        messages=list(self.messages)
+        task_message = getattr(self, '_task_message', None)
+        compact_context = ''
         if self._plan is not None and self._plan.data['strict']:
             # 小任务之间隔离长工具历史；同一步内保留完整 tool_calls/tool 组。
             current=self._plan.current()
@@ -1196,7 +1228,8 @@ class Agent:
             marker=getattr(self,'_context_marker',None)
             position=next((i for i,m in enumerate(self.messages) if m is marker),None)
             tail=self.messages[position+1:] if position is not None else self.messages[2:]
-            messages=[self.messages[0],{'role':'user','content':f'工作区：{self.workspace.root}\n当前完整目标：{self._task}'}]+tail
+            task_message = {'role':'user','content':f'工作区：{self.workspace.root}\n当前完整目标：{self._task}'}
+            messages=[self.messages[0],task_message]+tail
             context=''
         if research is not None and research.document:
             context = (('复杂 Word 文档先按当前小任务写详细分析笔记，再调用 assemble_document 汇总，最后逐项检查覆盖范围。\n'
@@ -1206,11 +1239,68 @@ class Agent:
                        'python-docx 或安装依赖。先据已有证据产出，不要反复只说准备生成。\n' + context)
         if self._plan is not None:
             context += '\n\n' + self._plan.context()
+            current = self._plan.current()
+            compact_context = f'计划与材料：.agent/tasks/{self._plan.data["id"]}/。'
+            if current:
+                compact_context += f'当前子任务 {current["id"]} {current["title"]}\n验收：{current["criteria"]}\n'
+                if current['source']:
+                    compact_context += f'源码：{current["source"]}\n'
+                if current['artifact']:
+                    compact_context += f'笔记：{current["artifact"]}（至少 {current["minimum"]} 字符，可分段追加）\n'
+                if self._plan.data.get('needs_refinement'):
+                    compact_context += '先 set_plan 拆分步骤，包含 title、kind、criteria。'
+                else:
+                    compact_context += '满足条件后 update_task(id,status="completed")。'
+            else:
+                compact_context += '所有子任务已完成，请简短总结交付物。'
+            if self._plan.data['document']:
+                compact_context += f'目标 Word：{self._plan.data["target"]}。按计划分节写笔记，汇总时用 assemble_document。'
+        if getattr(self, '_resume_context', ''):
+            failure = self._session_memory.get('last_failure', '')
+            evidence = (self._session_memory.get('results') or [''])[-1]
+            compact_context += '\n续做：先检查已有产物，接着未完成的步骤。'
+            if failure or evidence:
+                compact_context += '\n上次记录：' + (failure or evidence)[-320:]
         if getattr(self,'_manual_skill_rules',''):
-            context += '\n\n用户手动加载的技能规范：\n'+self._manual_skill_rules[:12000]
-        if not context:
-            return messages
-        return messages + [{'role': 'user', 'content': context}]
+            rules = '\n用户手动加载的技能规范：\n' + self._manual_skill_rules[:12000]
+            context += rules
+            compact_context += rules
+        if self._output_limit_streak:
+            instruction = ('上一轮达到输出上限，未完成的调用已丢弃。只生成一个短段落或一次小范围改动。'
+                           '长文分段保存到当前 Markdown 笔记，之后 append_file，最后汇总。')
+            context += '\n' + instruction
+            compact_context += '\n' + instruction
+        # These annotations exist only on the request copy. The client removes
+        # them before sending the OpenAI-compatible payload.
+        if not any(message is task_message for message in messages):
+            task_message = {'role': 'user', 'content': self._task}
+            messages.insert(1, task_message)
+        for index, message in enumerate(messages):
+            if message is task_message:
+                workspace = f'工作区：{self.workspace.root}\n' if self.workspace else ''
+                messages[index] = dict(message, _context_required=True, _context_short=workspace + self._task)
+            elif message.get('role') == 'system':
+                messages[index] = dict(message, _context_short=self._short_system_prompt(message['content']))
+            elif str(message.get('content') or '').startswith('OBSERVATION'):
+                messages[index] = dict(message, _context_observation=True)
+        if context:
+            messages.append({'role': 'user', 'content': context, '_context_short': compact_context,
+                             '_context_required': bool(compact_context)})
+        return messages
+
+    def _short_system_prompt(self, original):
+        if self.qa_mode:
+            return original
+        rules = ('你是工作区助手。依据当前用户任务和实际工具证据，每轮只调用一个工具。'
+                 '文件路径限制在工作区内。失败后修复并重新验证。使用中文。')
+        if self._native_mode():
+            return rules
+        signatures = []
+        for tool in openai_tools(cfg=self._config(), ws=self.workspace, task=self._task):
+            fn = tool['function']
+            signatures.append(fn['name'] + '(' + ','.join(fn.get('parameters', {}).get('properties', {})) + ')')
+        return (rules + '工具回复格式 ACTION: {"name":"工具名","arguments":{}}。最终回复格式 ANSWER: 正文。\n'
+                + '可用工具：' + '；'.join(signatures))
 
     def select_skill(self, name):
         from core.skills import discover, find
@@ -1404,8 +1494,15 @@ class Agent:
                 self.messages.pop(start)
             return True
 
+        # Retain more source history for larger windows. The client still
+        # applies the exact per-request budget after assembling the prompt.
+        input_limit = getattr(self, '_history_input_limit', None)
+        keep_chars = self.KEEP_CHARS
+        if input_limit:
+            keep_chars = max(keep_chars, min(256_000, input_limit * 4))
+            keep = max(keep, min(96, input_limit // 200))
         total = sum(_size(m) for m in self.messages)
-        while (len(self.messages) > keep + 1 or total > self.KEEP_CHARS):
+        while (len(self.messages) > keep + 1 or total > keep_chars):
             before = len(self.messages)
             if not _drop_oldest_unit():
                 break

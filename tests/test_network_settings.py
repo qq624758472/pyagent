@@ -82,6 +82,8 @@ for i in range(8):
         {'role': 'tool', 'tool_call_id': f'call_{i}', 'content': 'output' * 1000}])
 original = json.dumps(messages)
 client.RETRY_ON_CONN, client.RETRY_BACKOFF = 1, 0
+# Exercise the transport retry with a window large enough for the first request.
+cfg.llm_context_limit = 65536
 events = list(client.chat_turn(messages, timeout=(0.2, 0.08)))
 check('读取超时后缩短历史并成功重试', any(e.get('text') == 'Recovered' for e in events)
       and len(server.payloads) == 2 and len(server.payloads[1]['messages']) < len(server.payloads[0]['messages']))

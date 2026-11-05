@@ -80,6 +80,7 @@ TOOL_SCHEMAS = {
     "read_file": _schema({
         "path": ("string", "工作区内文件相对路径"),
         "line_start": ("integer", "可选，起始行号（1 起）；只看文件某一段时用它"),
+        "column_start": ("integer", "可选，起始行的字符列（1 起），用于续读长行"),
         "line_end": ("integer", "可选，结束行号")}, ["path"]),
     "write_file": _schema({
         "path": ("string", "工作区内文件相对路径"),
@@ -180,8 +181,9 @@ def _list_files(ws, cfg, path=".", recursive=False):
 @tool("read_file", "读取工作区内文本文件内容(限200KB，可指定行区间)",
       {"path": "文件相对路径",
        "line_start": "可选，起始行号（1 起）",
-       "line_end": "可选，结束行号"})
-def _read_file(ws, cfg, path, line_start=None, line_end=None, **extra):
+       "line_end": "可选，结束行号",
+       "column_start": "可选，起始行的字符列"})
+def _read_file(ws, cfg, path, line_start=None, line_end=None, column_start=None, _page_bytes=None, **extra):
     _need_ws(ws)
     # V31.2 容错：模型常用 IDE 风格别名（start_line/end_line/line）
     line_start = line_start or extra.get("start_line")
@@ -190,7 +192,8 @@ def _read_file(ws, cfg, path, line_start=None, line_end=None, **extra):
         line_start = line_end = extra.get("line")
     if extra:
         log.info("read_file 忽略多余参数: %s", ", ".join(extra))
-    return ws.read_file(path, line_start=line_start, line_end=line_end)
+    return ws.read_file(path, line_start=line_start, line_end=line_end,
+                        column_start=column_start, max_bytes=_page_bytes)
 
 
 @tool("write_file", "创建或覆盖文件(自动创建父目录)。.docx 自动将文本/基本Markdown转换为真正的Word文件并校验结构，禁止伪造二进制扩展名",
@@ -515,7 +518,7 @@ def _install_skill(ws, cfg, url="", subdir=""):
 
 
 def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
-                 confirm=None, should_stop=None, approved=None) -> str:
+                 confirm=None, should_stop=None, approved=None, read_page_bytes=None) -> str:
     """统一执行入口：永远返回字符串观察结果，不向 Agent 抛异常
 
     progress: 可选进度回调（callable(str)）。仅支持进度的工具
@@ -560,6 +563,8 @@ def execute_tool(name: str, ws, cfg, arguments: dict, progress=None,
                     f"可用工具: {', '.join(avail)}")
     kwargs = dict(arguments or {})
     params = _sig_params(t.handler)
+    if '_page_bytes' in params:
+        kwargs['_page_bytes'] = read_page_bytes
     if progress is not None and "_progress" in params:
         kwargs["_progress"] = progress
     if should_stop is not None and "_should_stop" in params:

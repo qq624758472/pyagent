@@ -5,11 +5,12 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
 from core.config import ModelProfile
+from core.context_budget import ContextBudget, context_size, estimate_tokens, fit_context, message_groups
 from core.log import get_logger, brief, mask
 
 log = get_logger("core.llm_client")
@@ -22,6 +23,16 @@ class LLMError(Exception):
 class LLMStreamInterrupted(LLMError):
     """已收到部分响应后网络中断；调用方必须丢弃本轮片段后才能重新请求。"""
     pass
+
+
+class LLMOutputLimit(LLMError):
+    """The service stopped generating before the current reply was complete."""
+
+
+class LLMContextExceeded(LLMError):
+    def __init__(self, limit=None):
+        super().__init__('模型服务拒绝了超出上下文窗口的请求。')
+        self.limit = limit
 
 
 # embedding 类模型名特征（无 chat 能力，不能用来对话/判定相关性）
@@ -53,6 +64,78 @@ class LLMClient:
         self.reasoning_fallback_used = False   # 最近一次是否用思考过程兜底当回复
         self._request_lock = threading.Lock()
         self._active_requests = set()
+        self._context_cache = {}
+        self.read_page_bytes = None
+
+    def _model_metadata(self, method, url, **kwargs):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        try:
+            with self._api_request(method, url, headers=headers, timeout=(1.2, 2),
+                                   allow_redirects=False, **kwargs) as response:
+                if response.status_code == 200:
+                    result = response.json()
+                    return result if isinstance(result, dict) else {}
+        except (requests.RequestException, ValueError):
+            pass
+        return {}
+
+    def _detect_context_window(self, model):
+        if not self.api_key:
+            return None, '保守预算（服务未报告窗口）'
+        base = self.base_url.rstrip('/')
+        parsed = urlsplit(base)
+        if parsed.path in ('/v1', ''):
+            native = urlunsplit((parsed.scheme, parsed.netloc, '/api', '', ''))
+            running = self._model_metadata('GET', native + '/ps').get('models')
+            if isinstance(running, list):
+                names = {model} if ':' in model else {model, model + ':latest'}
+                for item in running:
+                    if isinstance(item, dict) and (item.get('name') in names or item.get('model') in names):
+                        size = context_size(item.get('context_length'))
+                        if size:
+                            return size, 'Ollama 运行窗口'
+                # An unloaded Ollama model may specify a runtime window in its Modelfile.
+                info = self._model_metadata('POST', native + '/show', json={'model': model})
+                match = re.search(r'(?m)^\s*num_ctx\s+(\d+)\s*$', str(info.get('parameters', '')))
+                if match and (size := context_size(match[1])):
+                    return size, 'Ollama 模型配置'
+                info_fields = info.get('model_info') or {}
+                if isinstance(info_fields, dict):
+                    ceilings = [size for key, value in info_fields.items()
+                                if key.endswith('.context_length') and (size := context_size(value))]
+                    if ceilings:
+                        return min(4096, *ceilings), '保守预算（运行窗口未报告）'
+        metadata = self._model_metadata('GET', base + '/models/' + quote(model, safe=''))
+        keys = ('max_model_len', 'context_length', 'context_window', 'max_context_length')
+        size = next((size for key in keys if (size := context_size(metadata.get(key)))), None)
+        if size:
+            return size, '模型服务元数据'
+        entries = self._model_metadata('GET', base + '/models').get('data')
+        if isinstance(entries, list):
+            for item in entries:
+                if isinstance(item, dict) and item.get('id') == model:
+                    for key in keys:
+                        if size := context_size(item.get(key)):
+                            return size, '模型服务元数据'
+        return None, '保守预算（服务未报告窗口）'
+
+    def context_budget(self, model=None):
+        model = model or self.model
+        key = (self.base_url, model)
+        cached = self._context_cache.get(key)
+        input_cap = None
+        if cached and cached[0] > time.monotonic():
+            _, size, source, input_cap = cached
+        else:
+            size, source = self._detect_context_window(model)
+            ttl = 60 if source in ('Ollama 运行窗口', '模型服务元数据') else 10
+            self._context_cache[key] = (time.monotonic() + ttl, size, source, None)
+        override = context_size(getattr(self.cfg, 'llm_context_limit', 0))
+        if override and (not size or override < size or '保守' in source):
+            size, source = override, '手动窗口上限'
+        size = size or 4096
+        cap = 3072 if 'gpt-oss' in model.lower() else 8192
+        return ContextBudget(size, source, min(size // 4, cap), input_cap)
 
     def _timeouts(self, timeout=None):
         if timeout is not None:
@@ -86,40 +169,76 @@ class LLMClient:
         return isinstance(error, requests.ReadTimeout) or 'read timed out' in str(error).lower()
 
     @staticmethod
-    def _compact_retry_payload(payload):
+    def _compact_retry_payload(payload, protected=()):
         """只压缩旧对话；保留任务及最近完整的 tool_calls/tool 组，不改调用方历史。"""
         messages = payload.get('messages') or []
-        units, i = [], 2
-        while i < len(messages):
-            start = i
-            i += 1
-            if messages[start].get('role') == 'assistant' and messages[start].get('tool_calls'):
-                while i < len(messages) and messages[i].get('role') == 'tool':
-                    i += 1
-            units.append(messages[start:i])
-        if len(units) <= 2:
-            return payload
-        reduced = messages[:2] + [message for unit in units[-2:] for message in unit]
+        units = message_groups(messages)
+        latest_evidence = next((unit for unit in reversed(units)
+                                if unit[0].get('tool_calls') or
+                                str(unit[0].get('content') or '').startswith('OBSERVATION')), None)
+        reduced = [message for index, unit in enumerate(units)
+                   if index < 2 or index >= len(units) - 2 or unit is latest_evidence
+                   or any((m.get('role'), m.get('content')) in protected for m in unit)
+                   for message in unit]
         old_size = len(json.dumps(messages, ensure_ascii=False))
         new_size = len(json.dumps(reduced, ensure_ascii=False))
-        if new_size >= old_size * 0.8:
-            return payload
         reduced.append({'role': 'user', 'content': (
             '上一次模型请求读取超时，已缩短较早的工具历史。保留原任务、最近结果和已生成文件，'
             '继续未完成工作。缺失资料时重新读取相关文件，不要重建已完成产物；实际验证后再总结。')})
+        if new_size >= old_size * 0.8 or estimate_tokens(reduced) > estimate_tokens(messages):
+            return payload
         return dict(payload, messages=reduced)
 
-    def _payload(self, messages, model=None):
+    def _payload(self, messages, model=None, tools=None, budget=None):
         name = model or self.model
+        budget = budget or self.context_budget(name)
+        try:
+            messages, tools, self.read_page_bytes = fit_context(messages, tools, budget)
+        except ValueError as exc:
+            raise LLMError(str(exc)) from exc
         payload = {"model": name, "messages": messages,
-                   "temperature": self.cfg.temperature, "stream": True}
+                   "temperature": self.cfg.temperature, "stream": True, "max_tokens": budget.output}
+        if tools:
+            payload.update(tools=tools, tool_choice='auto')
         # gpt-oss 单轮生成预算，避免推理长时间占据工具执行循环。
         if "gpt-oss" in name.lower():
-            payload["max_tokens"] = getattr(self.cfg, "max_output_tokens", 3072)
             payload["reasoning_effort"] = getattr(self.cfg, "reasoning_effort", "low")
         return payload
 
-    def _iter_sse(self, payload, m_desc, timeout=None):
+    def _budgeted_events(self, messages, model, timeout, tools=None):
+        name = model or self.model
+        budget = self.context_budget(name)
+        protected = {(m.get('role'), m.get(field)) for m in messages if m.get('_context_required')
+                     for field in ('content', '_context_short') if field in m}
+        latest_user = next((m for m in reversed(messages) if m.get('role') == 'user'), None)
+        if not protected and latest_user:
+            protected.add(('user', latest_user.get('content')))
+        for attempt in range(2):
+            payload = self._payload(messages, name, tools, budget)
+            log.info('模型上下文 %s：%d token，估计输入 %d，输出上限 %d（%s）', name,
+                     budget.window, estimate_tokens(payload), budget.output, budget.source)
+            try:
+                yield from self._iter_sse(payload, f'model={name} msgs={len(payload["messages"])}',
+                                          timeout=timeout, protected=protected)
+                return
+            except LLMContextExceeded as exc:
+                if attempt:
+                    raise
+                # Use the server's reported limit when available. Otherwise
+                # retry once with a tighter estimate, keeping the real task.
+                limit = exc.limit or max(512, budget.window // 2)
+                override = context_size(getattr(self.cfg, 'llm_context_limit', 0))
+                input_cap = budget.input_limit * 3 // 4
+                if exc.limit:
+                    self._context_cache[(self.base_url, name)] = (
+                        time.monotonic() + 60, limit, '服务返回窗口', input_cap)
+                if override:
+                    limit = min(limit, override)
+                budget = ContextBudget(limit, '服务拒绝后收紧预算', min(budget.output, limit // 4),
+                                       input_cap=input_cap)
+                yield ('retry', f'模型服务返回上下文超限，按 {limit} token 重新分配并重试')
+
+    def _iter_sse(self, payload, m_desc, timeout=None, protected=()):
         """将阻塞网络读取与事件流分开：等待首字节时也可取消和发送等待状态。"""
         cancelled = threading.Event()
         events = queue.Queue(maxsize=128)
@@ -136,7 +255,7 @@ class LLMClient:
 
         def read():
             try:
-                for item in self._read_sse(payload, m_desc, timeout, cancelled):
+                for item in self._read_sse(payload, m_desc, timeout, cancelled, protected):
                     if cancelled.is_set():
                         return
                     send(item)
@@ -185,7 +304,7 @@ class LLMClient:
             for request in self._active_requests:
                 request.set()
 
-    def _read_sse(self, payload, m_desc, timeout=None, cancelled=None):
+    def _read_sse(self, payload, m_desc, timeout=None, cancelled=None, protected=()):
         """底层 SSE 迭代：产出 ("content"|"reasoning", 文本) 与 ("tool_delta", 片段列表)
 
         连接中断或可恢复的 HTTP 5xx 在尚未产出正文/工具调用时重试；其他 HTTP 错误不重试。
@@ -199,10 +318,19 @@ class LLMClient:
         for attempt in range(1 + self.RETRY_ON_CONN):
             if cancelled is not None and cancelled.is_set():
                 return
+            detail = ""
             try:
                 with self._api_request('POST', url, headers=headers, json=payload,
                                        stream=True, timeout=req_timeout) as r:
-                    r.raise_for_status()
+                    try:
+                        r.raise_for_status()
+                    except requests.HTTPError:
+                        # Read the error while the streaming connection is open.
+                        try:
+                            detail = next(r.iter_content(chunk_size=4096), b'').decode('utf-8', errors='replace').strip()
+                        except requests.RequestException:
+                            pass
+                        raise
                     r.encoding = "utf-8"
                     for line in r.iter_lines(chunk_size=1, decode_unicode=True):
                         if cancelled is not None and cancelled.is_set():
@@ -217,7 +345,10 @@ class LLMClient:
                         except json.JSONDecodeError:
                             log.debug("LLM 无法解析的 SSE 行: %s", brief(data, 120))
                             continue
-                        d = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                        choice = (chunk.get("choices") or [{}])[0]
+                        if choice.get('finish_reason') == 'length':
+                            raise LLMOutputLimit('模型达到本轮输出预算，未完成的回复或工具参数已丢弃。')
+                        d = choice.get("delta") or {}
                         # 思考模型的推理内容在独立字段（部分网关如此）——
                         # 此前只读 content，遇到只吐 reasoning 的模型会
                         # 连续拿到空回复（日志 chunks=0 连环实证，V23 修复）
@@ -237,15 +368,10 @@ class LLMClient:
                 if cancelled is not None and cancelled.is_set():
                     return
                 code = e.response.status_code if e.response is not None else "?"
-                detail = ""
-                if e.response is not None:
-                    try:
-                        raw_detail = e.response.content or b""
-                        if isinstance(raw_detail, bytes):
-                            raw_detail = raw_detail.decode("utf-8", errors="replace")
-                        detail = str(raw_detail).strip()[:240]
-                    except Exception:
-                        detail = ""
+                if code in (400, 413, 422) and re.search(
+                        r'context_length_exceeded|maximum context length|context window|exceeds.{0,30}context', detail, re.I):
+                    match = re.search(r'(?:maximum context length|context window|n_ctx)\D{0,24}(\d{3,8})', detail, re.I)
+                    raise LLMContextExceeded(context_size(match[1]) if match else None) from e
                 # 推理服务/FRP 网关偶发 500/502/503/504：未收到正文或工具调用时安全重试。
                 # 已流出工具调用片段时不可重试，否则可能拼接/重复工具命令。
                 if (code in (500, 502, 503, 504) and chunks == 0
@@ -260,7 +386,7 @@ class LLMClient:
                         time.sleep(wait)
                     continue
                 log.error("LLM 请求失败 %s HTTP %s", m_desc, code)
-                suffix = f"；服务端信息: {detail}" if detail else ""
+                suffix = f"；服务端信息: {detail[:240]}" if detail else ""
                 raise LLMError(
                     f"API 请求失败(HTTP {code})，请检查 base_url/api_key/模型名。{suffix}") from e
             except requests.RequestException as e:
@@ -278,7 +404,7 @@ class LLMClient:
                     raise error_type(f"网络错误: {e}") from e
                 wait = self.RETRY_BACKOFF * (attempt + 1)
                 if self._is_read_timeout(e):
-                    compact = self._compact_retry_payload(payload)
+                    compact = self._compact_retry_payload(payload, protected)
                     changed = compact is not payload
                     payload = compact
                     yield ('retry', f"模型读取超时，{'已缩短历史，' if changed else ''}准备重试 {attempt + 1}/{self.RETRY_ON_CONN}（{self._route_label(url)}）")
@@ -298,8 +424,7 @@ class LLMClient:
         if not self.api_key:
             raise LLMError("未配置 API Key。请设置环境变量 AGENT_API_KEY，"
                            "或通过界面「设置…」/控制台 /key 配置。")
-        payload = self._payload(messages, model)
-        m_desc = (f"model={payload['model']} msgs={len(messages)}"
+        m_desc = (f"model={model or self.model} msgs={len(messages)}"
                   f" total_chars={sum(len(m.get('content') or '') for m in messages)}")
         log.info("LLM 请求开始 %s", m_desc)
         log.debug("LLM 完整 messages: %s", mask(json.dumps(
@@ -310,7 +435,7 @@ class LLMClient:
         last_activity_beat = t0
         self.last_reasoning = ""
         self.reasoning_fallback_used = False
-        for kind, data in self._iter_sse(payload, m_desc, timeout=timeout):
+        for kind, data in self._budgeted_events(messages, model, timeout):
             if kind in ("waiting", "retry"):
                 yield ""  # Agent 将其转换成 keepalive，不计作正文或进展。
             elif kind == "content":
@@ -356,12 +481,9 @@ class LLMClient:
         if not self.api_key:
             raise LLMError("未配置 API Key。请设置环境变量 AGENT_API_KEY，"
                            "或通过界面「设置…」/控制台 /key 配置。")
-        payload = self._payload(messages, model)
         if tools:
             self.reasoning_fallback_used = False
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        m_desc = (f"model={payload['model']} msgs={len(messages)}"
+        m_desc = (f"model={model or self.model} msgs={len(messages)}"
                   f" tools={len(tools or [])}"
                   f" total_chars={sum(len(m.get('content', '') or '') for m in messages)}")
         log.info("LLM 请求开始 %s", m_desc)
@@ -369,7 +491,7 @@ class LLMClient:
         calls = {}                 # index -> {id, name, arguments}
         content_parts, reasoning_parts = [], []
         last_beat = t0
-        for kind, data in self._iter_sse(payload, m_desc, timeout=timeout):
+        for kind, data in self._budgeted_events(messages, model, timeout, tools):
             if kind == 'retry':
                 yield {'type': 'progress', 'content': data}
                 continue
